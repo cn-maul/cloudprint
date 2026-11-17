@@ -1,0 +1,13 @@
+.git
+.env
+data
+backend/data
+backend/testdata
+backend/dist
+backend/*.log
+backend/.smoke*
+web/node_modules
+web/dist
+*.db
+*.db-shm
+*.db-wal

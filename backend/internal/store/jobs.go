@@ -1,0 +1,418 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type NewJob struct {
+	UserID    string `json:"-"`
+	PrinterID string `json:"printer_id"`
+	FileID    string `json:"file_id"`
+	Copies    int    `json:"copies"`
+	Duplex    string `json:"duplex"`
+	ColorMode string `json:"color_mode"`
+	PaperSize string `json:"paper_size"`
+	RetryOf   string `json:"-"`
+	PDFFileID string `json:"-"`
+}
+
+func (s *Store) PagesToday(ctx context.Context, userID string) (int, error) {
+	start := startOfToday()
+	var n sql.NullInt64
+	err := s.DB.QueryRowContext(ctx, `SELECT SUM(page_count * copies) FROM print_jobs
+		WHERE user_id = ? AND created_at >= ? AND status NOT IN ('rejected','canceled')`,
+		userID, start).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return int(n.Int64), nil
+}
+
+// startOfToday uses the NAS's local clock so "daily quota" resets at local
+// midnight rather than 08:00 China time.
+func startOfToday() string {
+	now := time.Now()
+	y, m, d := now.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, now.Location()).UTC().Format(time.RFC3339)
+}
+
+func (s *Store) CreateJob(ctx context.Context, in NewJob) (*Job, error) {
+	printer, err := s.GetPrinter(ctx, in.PrinterID)
+	if err != nil {
+		return nil, err
+	}
+	if !printer.IsEnabled {
+		return nil, fmt.Errorf("该打印机已停用")
+	}
+	file, err := s.GetFile(ctx, in.FileID)
+	if err != nil {
+		return nil, fmt.Errorf("文件不存在或已过期")
+	}
+	if file.OwnerID != in.UserID {
+		return nil, fmt.Errorf("无权使用该文件")
+	}
+	if file.Kind != "pdf" {
+		return nil, fmt.Errorf("文件尚未完成转换")
+	}
+	if file.StoragePath == "" {
+		return nil, fmt.Errorf("文件已超过保留期并被清理，请重新上传")
+	}
+	in.PDFFileID = file.ID
+	if in.Copies < 1 {
+		in.Copies = 1
+	}
+	if in.Copies > 99 {
+		in.Copies = 99
+	}
+	if in.Duplex == "" {
+		in.Duplex = "one-sided"
+	}
+	if in.Duplex != "one-sided" && in.Duplex != "two-sided-long-edge" && in.Duplex != "two-sided-short-edge" {
+		return nil, fmt.Errorf("无效的双面参数")
+	}
+	if in.PaperSize == "" {
+		in.PaperSize = "A4"
+	}
+	if in.ColorMode == "" {
+		in.ColorMode = "monochrome"
+	}
+	if in.ColorMode != "monochrome" && in.ColorMode != "color" {
+		return nil, fmt.Errorf("无效的颜色参数")
+	}
+	now := Now()
+	j := &Job{
+		ID:           "j_" + uuid.NewString(),
+		UserID:       in.UserID,
+		PrinterID:    printer.ID,
+		PrinterName:  printer.DisplayName,
+		OriginalFile: file.ID,
+		PDFFile:      in.PDFFileID,
+		FileName:     file.OriginalName,
+		Status:       "queued",
+		Copies:       in.Copies,
+		Duplex:       in.Duplex,
+		ColorMode:    in.ColorMode,
+		PaperSize:    in.PaperSize,
+		PageCount:    file.PageCount,
+		TotalPages:   file.PageCount * in.Copies,
+		RetryOf:      in.RetryOf,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	var retry any
+	if j.RetryOf != "" {
+		retry = j.RetryOf
+	}
+	_, err = s.DB.ExecContext(ctx, `INSERT INTO print_jobs
+		(id, user_id, printer_id, original_file_id, pdf_file_id, status, copies, duplex,
+		color_mode, paper_size, page_count, retry_of, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)`,
+		j.ID, j.UserID, j.PrinterID, j.OriginalFile, j.PDFFile, j.Copies, j.Duplex,
+		j.ColorMode, j.PaperSize, j.PageCount, retry, j.CreatedAt, j.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return j, nil
+}
+
+const jobSelect = `SELECT j.id, j.user_id, COALESCE(u.display_name, u.username, '') AS username,
+	j.printer_id, COALESCE(p.display_name, '') AS printer_name, COALESCE(j.endpoint_id, ''),
+	COALESCE(e.uri, ''), COALESCE(j.agent_id, ''), COALESCE(j.original_file_id, ''),
+	COALESCE(j.pdf_file_id, ''), COALESCE(f.original_name, ''), j.status, j.copies, j.duplex,
+	j.color_mode, j.paper_size, j.page_count, j.error_code, j.error_message,
+	COALESCE(j.retry_of, ''), j.created_at, j.updated_at, COALESCE(j.claimed_at, ''),
+	COALESCE(j.lease_expires_at, ''), COALESCE(j.started_at, ''), COALESCE(j.finished_at, ''),
+	COALESCE(e.queue_name, '')
+	FROM print_jobs j
+	LEFT JOIN users u ON u.id = j.user_id
+	LEFT JOIN printers p ON p.id = j.printer_id
+	LEFT JOIN printer_endpoints e ON e.id = j.endpoint_id
+	LEFT JOIN files f ON f.id = j.pdf_file_id`
+
+func scanJob(row rowScanner) (Job, error) {
+	var j Job
+	err := row.Scan(&j.ID, &j.UserID, &j.Username, &j.PrinterID, &j.PrinterName,
+		&j.EndpointID, &j.EndpointURI, &j.AgentID, &j.OriginalFile, &j.PDFFile,
+		&j.FileName, &j.Status, &j.Copies, &j.Duplex, &j.ColorMode, &j.PaperSize,
+		&j.PageCount, &j.ErrorCode, &j.ErrorMessage, &j.RetryOf, &j.CreatedAt,
+		&j.UpdatedAt, &j.ClaimedAt, &j.LeaseExpires, &j.StartedAt, &j.FinishedAt,
+		&j.QueueName)
+	j.TotalPages = j.PageCount * j.Copies
+	return j, err
+}
+
+func (s *Store) GetJob(ctx context.Context, id string) (*Job, error) {
+	row := s.DB.QueryRowContext(ctx, jobSelect+` WHERE j.id = ?`, id)
+	j, err := scanJob(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &j, nil
+}
+
+func (s *Store) ListJobs(ctx context.Context, f JobFilter) ([]Job, int, error) {
+	where := []string{"1=1"}
+	args := []any{}
+	if f.UserID != "" {
+		where = append(where, "j.user_id = ?")
+		args = append(args, f.UserID)
+	}
+	if len(f.Statuses) > 0 {
+		ph := make([]string, len(f.Statuses))
+		for i, st := range f.Statuses {
+			ph[i] = "?"
+			args = append(args, st)
+		}
+		where = append(where, "j.status IN ("+strings.Join(ph, ",")+")")
+	}
+	if f.Limit <= 0 || f.Limit > 200 {
+		f.Limit = 50
+	}
+	var total int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM print_jobs j WHERE `+strings.Join(where, " AND "), args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	args = append(args, f.Limit, f.Offset)
+	rows, err := s.DB.QueryContext(ctx, jobSelect+` WHERE `+strings.Join(where, " AND ")+
+		` ORDER BY j.created_at DESC LIMIT ? OFFSET ?`, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := []Job{}
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, j)
+	}
+	return out, total, rows.Err()
+}
+
+func (s *Store) CancelJob(ctx context.Context, id, userID string, isAdmin bool) error {
+	q := `UPDATE print_jobs SET status = 'canceled', updated_at = ?, finished_at = ?
+		WHERE id = ? AND status = 'queued'`
+	args := []any{Now(), Now(), id}
+	if !isAdmin {
+		q += ` AND user_id = ?`
+		args = append(args, userID)
+	}
+	res, err := s.DB.ExecContext(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("任务不在可取消状态")
+	}
+	return nil
+}
+
+// ClaimJob atomically reserves the next queued job for an endpoint, enforcing
+// one active job per logical printer.
+func (s *Store) ClaimJob(ctx context.Context, printerID, endpointID, agentID string, lease time.Duration) (*Job, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var busy int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM print_jobs
+		WHERE printer_id = ? AND status IN ('claimed','printing')`, printerID).Scan(&busy); err != nil {
+		return nil, err
+	}
+	if busy > 0 {
+		return nil, nil
+	}
+	var id string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM print_jobs
+		WHERE printer_id = ? AND status = 'queued'
+		ORDER BY created_at LIMIT 1`, printerID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	leaseExp := now.Add(lease).Format(time.RFC3339)
+	res, err := tx.ExecContext(ctx, `UPDATE print_jobs SET status = 'claimed', endpoint_id = ?,
+		agent_id = NULLIF(?, ''), claimed_at = ?, lease_expires_at = ?, updated_at = ?
+		WHERE id = ? AND status = 'queued'`,
+		endpointID, agentID, now.Format(time.RFC3339), leaseExp, now.Format(time.RFC3339), id)
+	if err != nil {
+		return nil, err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return nil, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.GetJob(ctx, id)
+}
+
+func (s *Store) MarkPrinting(ctx context.Context, id, endpointID string) error {
+	res, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = 'printing', started_at = ?,
+		updated_at = ? WHERE id = ? AND status = 'claimed' AND endpoint_id = ?`,
+		Now(), Now(), id, endpointID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return fmt.Errorf("任务状态不允许开始打印")
+	}
+	return nil
+}
+
+func (s *Store) ReleaseClaim(ctx context.Context, id string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = 'queued',
+		endpoint_id = NULL, agent_id = NULL, claimed_at = NULL, lease_expires_at = NULL,
+		updated_at = ? WHERE id = ? AND status = 'claimed'`, Now(), id)
+	return err
+}
+
+func (s *Store) CompleteJob(ctx context.Context, id, endpointID string, ok bool, code, message string) error {
+	status := "completed"
+	if !ok {
+		status = "failed"
+	}
+	res, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = ?, error_code = ?,
+		error_message = ?, finished_at = ?, updated_at = ?
+		WHERE id = ? AND endpoint_id = ? AND status IN ('claimed','printing')`,
+		status, code, truncate(message, 1000), Now(), Now(), id, endpointID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return fmt.Errorf("任务状态不允许完成")
+	}
+	return nil
+}
+
+func (s *Store) RequeueExpiredClaims(ctx context.Context) (int, error) {
+	res, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = 'queued',
+		endpoint_id = NULL, agent_id = NULL, claimed_at = NULL, lease_expires_at = NULL,
+		updated_at = ? WHERE status = 'claimed' AND lease_expires_at < ?`,
+		Now(), Now())
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+func (s *Store) HasActiveJob(ctx context.Context, printerID string) (bool, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM print_jobs
+		WHERE printer_id = ? AND status IN ('claimed','printing')`, printerID).Scan(&n)
+	return n > 0, err
+}
+
+// ClaimQueuedJob atomically reserves one specific queued job for an endpoint.
+// The NOT EXISTS clause makes the one-active-job-per-printer rule part of the
+// same statement, so two dispatchers cannot start two jobs on one printer.
+func (s *Store) ClaimQueuedJob(ctx context.Context, jobID, endpointID, agentID string, lease time.Duration) (*Job, error) {
+	now := time.Now().UTC()
+	leaseExp := now.Add(lease).Format(time.RFC3339)
+	res, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = 'claimed',
+		endpoint_id = ?, agent_id = NULLIF(?, ''), claimed_at = ?, lease_expires_at = ?,
+		updated_at = ?
+		WHERE id = ? AND status = 'queued'
+		AND NOT EXISTS (
+			SELECT 1 FROM print_jobs active
+			WHERE active.printer_id = print_jobs.printer_id
+			AND active.status IN ('claimed','printing')
+		)`,
+		endpointID, agentID, now.Format(time.RFC3339), leaseExp,
+		now.Format(time.RFC3339), jobID)
+	if err != nil {
+		return nil, err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return nil, nil
+	}
+	return s.GetJob(ctx, jobID)
+}
+
+func (s *Store) QueuedJobs(ctx context.Context, limit int) ([]Job, error) {
+	rows, err := s.DB.QueryContext(ctx, jobSelect+` WHERE j.status = 'queued'
+		ORDER BY j.created_at LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Job{}
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SetJobPDF(ctx context.Context, id, pdfID string, pages int) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET pdf_file_id = ?, page_count = ?,
+		updated_at = ? WHERE id = ?`, pdfID, pages, Now(), id)
+	return err
+}
+
+func (s *Store) Dashboard(ctx context.Context, userID string) (Dashboard, error) {
+	d := Dashboard{StatusCounts: map[string]int{}, RecentJobs: []Job{}}
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM printers`).Scan(&d.PrintersTotal)
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM printers WHERE is_enabled = 1`).Scan(&d.PrintersEnabled)
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM print_jobs WHERE status = 'queued'`).Scan(&d.QueuedJobs)
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM print_jobs WHERE status IN ('claimed','printing')`).Scan(&d.PrintingJobs)
+	start := startOfToday()
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM print_jobs WHERE status = 'failed' AND created_at >= ?`, start).Scan(&d.FailedJobsToday)
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM print_jobs WHERE status = 'completed' AND created_at >= ?`, start).Scan(&d.CompletedToday)
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM printer_candidates WHERE status = 'new'`).Scan(&d.NewCandidates)
+
+	rows, err := s.DB.QueryContext(ctx, `SELECT status, COUNT(*) FROM print_jobs GROUP BY status`)
+	if err == nil {
+		for rows.Next() {
+			var st string
+			var n int
+			if rows.Scan(&st, &n) == nil {
+				d.StatusCounts[st] = n
+			}
+		}
+		rows.Close()
+	}
+	agents, err := s.ListAgents(ctx)
+	if err == nil {
+		d.AgentsTotal = len(agents)
+		for _, a := range agents {
+			if a.Online {
+				d.AgentsOnline++
+			}
+		}
+	}
+	user, err := s.GetUser(ctx, userID)
+	if err == nil {
+		d.DailyPageQuota = user.DailyPageQuota
+		d.DailyPages, _ = s.PagesToday(ctx, userID)
+	}
+	jobs, _, err := s.ListJobs(ctx, JobFilter{UserID: userID, Limit: 8})
+	if err == nil {
+		d.RecentJobs = jobs
+	}
+	return d, nil
+}
