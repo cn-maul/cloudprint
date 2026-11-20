@@ -109,6 +109,7 @@ func (s *Server) Routes() http.Handler {
 			r.Get("/jobs/{id}", s.handleGetJob)
 			r.Post("/jobs/{id}/cancel", s.handleCancelJob)
 			r.Post("/jobs/{id}/retry", s.handleRetryJob)
+			r.Post("/jobs/{id}/reprint", s.handleReprintJob)
 			r.Post("/printers/{id}/jobs/clear", s.handleClearJobs)
 			r.Get("/printers/{id}/events", s.handlePrinterEvents)
 			r.Get("/printers/{id}/diagnostics", s.handlePrinterDiagnostics)

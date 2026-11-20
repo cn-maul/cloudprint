@@ -467,6 +467,102 @@ func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, job)
 }
 
+// handleReprintJob submits another copy of a finished job.
+//
+// "再打一份" is the most common office request after a document comes out, and
+// making the user find the file and set the page range again is pure friction.
+// The stored (already page-ranged) PDF is reused verbatim, so what gets printed
+// is exactly what came out the first time.
+func (s *Server) handleReprintJob(w http.ResponseWriter, r *http.Request) {
+	u := currentUser(r)
+	src, err := s.Store.GetJob(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "JOB_NOT_FOUND", "任务不存在")
+		return
+	}
+	if src.UserID != u.ID {
+		writeErr(w, http.StatusForbidden, "FORBIDDEN", "无权重打该任务")
+		return
+	}
+	if src.Status != "completed" {
+		writeErr(w, http.StatusConflict, "REPRINT_NOT_ALLOWED",
+			"只有已出纸的任务可以再打一份")
+		return
+	}
+	if src.PrinterID == "" {
+		writeErr(w, http.StatusConflict, "PRINTER_GONE", "这台打印机已被删除")
+		return
+	}
+	p, err := s.Store.GetPrinter(r.Context(), src.PrinterID)
+	if err != nil || !p.IsEnabled {
+		writeErr(w, http.StatusConflict, "PRINTER_GONE", "这台打印机已删除或停用")
+		return
+	}
+	file, err := s.Store.GetFile(r.Context(), src.PDFFile)
+	if err != nil || file.StoragePath == "" {
+		writeErr(w, http.StatusGone, "FILE_EXPIRED",
+			"原始文件已超过保留期被清理，请重新上传后再打印")
+		return
+	}
+	// An empty body means "一样的再来一份".
+	var in struct {
+		Copies int `json:"copies"`
+	}
+	if r.ContentLength > 0 {
+		if !decodeJSON(w, r, &in) {
+			return
+		}
+	}
+	copies := in.Copies
+	if copies <= 0 {
+		copies = src.Copies
+	}
+	if copies > 99 {
+		copies = 99
+	}
+	pages := src.PageCount
+	if pages <= 0 {
+		pages = file.PageCount
+	}
+	used, err := s.Store.PagesToday(r.Context(), u.ID)
+	if err != nil {
+		s.jsonError(w, err)
+		return
+	}
+	required := pages * copies
+	if u.DailyPageQuota > 0 && used+required > u.DailyPageQuota {
+		writeErr(w, http.StatusTooManyRequests, "QUOTA_EXCEEDED",
+			fmt.Sprintf("今日剩余 %d 页，本次需要 %d 页。", maxInt(u.DailyPageQuota-used, 0), required))
+		return
+	}
+	if printer.SelectEndpoint(p, src.Duplex) == nil {
+		writeErr(w, http.StatusConflict, "PRINTER_OFFLINE", "这台打印机现在连不上，请稍后再试")
+		return
+	}
+	job, err := s.Store.CreateJob(r.Context(), store.NewJob{
+		UserID:         u.ID,
+		PrinterID:      p.ID,
+		FileID:         src.PDFFile,
+		Copies:         copies,
+		Duplex:         src.Duplex,
+		ColorMode:      src.ColorMode,
+		PaperSize:      src.PaperSize,
+		PageRange:      src.PageRange,
+		Pages:          pages,
+		OriginalFileID: src.OriginalFile,
+	})
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "JOB_REJECTED", err.Error())
+		return
+	}
+	s.Store.Audit(r.Context(), u.ID, "reprint", "job", job.ID,
+		map[string]any{"reprint_of": src.ID, "printer_id": job.PrinterID, "copies": copies})
+	s.Log.Info("job reprinted", "job", job.ID, "of", src.ID, "user", u.Username)
+	s.Hub.Publish(job.UserID, "job.created", job)
+	go s.tryDispatch(job.ID, u.ID)
+	writeJSON(w, http.StatusCreated, job)
+}
+
 func maxInt(a, b int) int {
 	if a > b {
 		return a
