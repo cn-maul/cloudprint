@@ -467,6 +467,36 @@ func (s *Store) HasActiveJob(ctx context.Context, printerID string) (bool, error
 	return n > 0, err
 }
 
+// PrinterQueueCounts returns how many jobs each printer has waiting and in
+// flight. The printer list needs this to say "2 waiting" without fetching every
+// queue separately.
+func (s *Store) PrinterQueueCounts(ctx context.Context) (map[string]struct{ Queued, Printing int }, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT printer_id, status, COUNT(*)
+		FROM print_jobs WHERE status IN ('queued','claimed','printing')
+		GROUP BY printer_id, status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]struct{ Queued, Printing int }{}
+	for rows.Next() {
+		var id string
+		var status string
+		var n int
+		if err := rows.Scan(&id, &status, &n); err != nil {
+			return nil, err
+		}
+		c := out[id]
+		if status == "queued" {
+			c.Queued = n
+		} else {
+			c.Printing = n
+		}
+		out[id] = c
+	}
+	return out, rows.Err()
+}
+
 // ClaimQueuedJob atomically reserves one specific queued job for an endpoint.
 // The NOT EXISTS clause makes the one-active-job-per-printer rule part of the
 // same statement, so two dispatchers cannot start two jobs on one printer.

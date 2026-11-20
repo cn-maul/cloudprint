@@ -7,6 +7,7 @@ import {
   printerStateLabel,
   type Job,
   type PrinterDetail,
+  type PrinterOptions,
   type UploadResult,
 } from "../lib/api";
 import {notifyError, notifySuccess, notifyWarning} from "../lib/toast";
@@ -14,6 +15,7 @@ import {
   AlertIcon,
   ArrowLeftIcon,
   CheckIcon,
+  ChevronRightIcon,
   CloseIcon,
   CopyIcon,
   FileIcon,
@@ -22,14 +24,23 @@ import {
   PlusIcon,
   PrinterIcon,
   RefreshIcon,
+  RetryIcon,
   StopIcon,
   TrashIcon,
   UploadIcon,
 } from "../components/Icon";
 
-// Terminal states only. "queued", "claimed" and "printing" are still live and
-// are never cleared — the backend enforces the same rule.
 const FINISHED_STATUSES = ["completed", "failed", "canceled"];
+const PAGE_SIZE = 20;
+
+type FilterKey = "all" | "active" | "done" | "problem";
+
+const FILTERS: Array<{key: FilterKey; label: string; status?: string}> = [
+  {key: "all", label: "全部"},
+  {key: "active", label: "进行中", status: "queued,claimed,printing"},
+  {key: "done", label: "已完成", status: "completed"},
+  {key: "problem", label: "异常", status: "failed,canceled"},
+];
 
 export default function PrinterDetailPage({
   printerId,
@@ -39,32 +50,68 @@ export default function PrinterDetailPage({
   onBack: () => void;
 }) {
   const [detail, setDetail] = useState<PrinterDetail | null>(null);
+  const [options, setOptions] = useState<PrinterOptions | null>(null);
   const [error, setError] = useState("");
+  const [filter, setFilter] = useState<FilterKey>("all");
+  const [offset, setOffset] = useState(0);
   const [file, setFile] = useState<UploadResult | null>(null);
   const [pages, setPages] = useState("");
   const [copies, setCopies] = useState(1);
+  const [paper, setPaper] = useState("A4");
   const [uploading, setUploading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [drag, setDrag] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const pending = useRef(false);
 
   const load = useCallback(async () => {
+    const q = new URLSearchParams({limit: String(PAGE_SIZE), offset: String(offset)});
+    const st = FILTERS.find((f) => f.key === filter)?.status;
+    if (st) q.set("status", st);
     try {
-      const r = await api<PrinterDetail>(`/api/printers/${printerId}`);
+      const r = await api<PrinterDetail>(`/api/printers/${printerId}?${q.toString()}`);
       setDetail(r);
       setError("");
     } catch (e) {
       setError(e instanceof Error ? e.message : "载入失败");
     }
-  }, [printerId]);
+  }, [printerId, filter, offset]);
+
+  const loadOptions = useCallback(async () => {
+    try {
+      const r = await api<PrinterOptions>(`/api/printers/${printerId}/options`);
+      setOptions(r);
+      if (r.paper_sizes?.length && !r.paper_sizes.includes(paper)) {
+        setPaper(r.paper_sizes.includes("A4") ? "A4" : r.paper_sizes[0]);
+      }
+    } catch {
+      setOptions(null);
+    }
+  }, [printerId, paper]);
 
   useEffect(() => {
     void load();
-    const t = setInterval(() => void load(), 5000);
+  }, [load]);
+
+  useEffect(() => {
+    void loadOptions();
+    // Only on printer change; paper options are stable while the page is open.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [printerId]);
+
+  useEffect(() => {
+    const t = setInterval(() => void load(), 4000);
     const es = new EventSource("/api/jobs/events");
-    const refresh = () => void load();
-    ["job.created", "job.completed", "job.failed", "job.printing", "job.canceled", "job.waiting", "job.claimed"].forEach(
-      (ev) => es.addEventListener(ev, refresh),
+    const refresh = () => {
+      if (pending.current) return;
+      pending.current = true;
+      window.setTimeout(() => {
+        pending.current = false;
+        void load();
+      }, 400);
+    };
+    ["job.created", "job.completed", "job.failed", "job.printing", "job.canceled", "job.waiting"].forEach((ev) =>
+      es.addEventListener(ev, refresh),
     );
     return () => {
       clearInterval(t);
@@ -107,13 +154,14 @@ export default function PrinterDetailPage({
           copies,
           duplex: "one-sided",
           color_mode: "monochrome",
-          paper_size: "A4",
+          paper_size: paper,
           page_range: pages.trim(),
         }),
       });
       notifySuccess("已加入队列");
       clearFile();
       setCopies(1);
+      setOffset(0);
       await load();
     } catch (e) {
       const msg = e instanceof Error ? e.message : "提交失败";
@@ -127,23 +175,41 @@ export default function PrinterDetailPage({
   }
 
   async function cancel(j: Job) {
-    if (!window.confirm(`取消“${j.file_name || "这个任务"}”？`)) return;
     try {
       await api(`/api/jobs/${j.id}/cancel`, {method: "POST"});
+      notifySuccess("已取消");
       await load();
     } catch (e) {
       notifyError("取消失败", e instanceof Error ? e.message : "");
     }
   }
 
-  // Clearing is only about tidying the queue view: the backend refuses to
-  // delete anything still queued, printing or on its way to the device.
+  async function retry(j: Job) {
+    try {
+      await api(`/api/jobs/${j.id}/retry`, {method: "POST"});
+      notifySuccess("已重新排队");
+      await load();
+    } catch (e) {
+      notifyError("重试失败", e instanceof Error ? e.message : "");
+    }
+  }
+
+  async function reprint(j: Job) {
+    try {
+      await api(`/api/jobs/${j.id}/reprint`, {method: "POST"});
+      notifySuccess("已重新排队");
+      await load();
+    } catch (e) {
+      notifyError("再打失败", e instanceof Error ? e.message : "");
+    }
+  }
+
   async function clearFinished() {
-    const n = finishedCount;
-    if (n === 0) return;
-    if (!window.confirm(`清除 ${n} 条已结束的任务记录？正在打印和排队的任务不受影响。`)) return;
+    if (finishedCount === 0) return;
+    if (!window.confirm(`清除 ${finishedCount} 条已结束的任务记录？正在打印和排队的任务不受影响。`)) return;
     try {
       const r = await api<{removed: number}>(`/api/printers/${printerId}/jobs/clear`, {method: "POST"});
+      setOffset(0);
       await load();
       notifySuccess(`已清除 ${r.removed} 条记录`);
     } catch (e) {
@@ -166,12 +232,14 @@ export default function PrinterDetailPage({
     );
   }
 
-  const {printer, status, jobs} = detail;
+  const {printer, status, jobs, total} = detail;
   const totalPages = file ? countPages(pages, file.page_count) : 0;
-  const copiesMax = Math.max(1, Math.min(99, printer.endpoints?.[0]?.capabilities?.max_copies ?? 99));
+  const copiesMax = Math.max(1, Math.min(99, options?.copies_max ?? 99));
   const offline = status.state === "stopped" || status.state === "unknown";
   const problem = isProblem(status.message);
   const finishedCount = jobs.filter((j) => FINISHED_STATUSES.includes(j.status)).length;
+  const paperSizes = options?.paper_sizes?.length ? options.paper_sizes : ["A4"];
+  const activeJob = jobs.find((j) => j.status === "printing");
 
   return (
     <div className="space-y-5">
@@ -208,18 +276,31 @@ export default function PrinterDetailPage({
 
       <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px]">
         <section className="overflow-hidden rounded-2xl border border-separator/60 bg-surface/60">
-          <header className="flex items-center gap-2 border-b border-separator/50 px-5 py-3 text-muted">
-            <ListIcon size={16} />
-            <span className="mono text-xs">{jobs.length}</span>
-            {finishedCount > 0 ? (
-              <Button
-                className="ml-auto"
-                size="sm"
-                variant="ghost"
-                onPress={() => void clearFinished()}
+          <header className="flex flex-wrap items-center gap-1.5 border-b border-separator/50 px-3 py-2.5">
+            <span className="mr-1 grid size-7 place-items-center text-muted">
+              <ListIcon size={15} />
+            </span>
+            {FILTERS.map((f) => (
+              <button
+                className={`rounded-lg px-2.5 py-1 text-xs transition ${
+                  filter === f.key
+                    ? "bg-accent/12 font-medium text-accent"
+                    : "text-muted hover:bg-default/50 hover:text-foreground"
+                }`}
+                key={f.key}
+                onClick={() => {
+                  setFilter(f.key);
+                  setOffset(0);
+                }}
+                type="button"
               >
+                {f.label}
+              </button>
+            ))}
+            <span className="mono ml-auto text-[11px] text-muted">{total}</span>
+            {finishedCount > 0 ? (
+              <Button isIconOnly aria-label="清除已结束任务" size="sm" variant="ghost" onPress={() => void clearFinished()}>
                 <TrashIcon size={15} />
-                清除
               </Button>
             ) : null}
           </header>
@@ -230,10 +311,39 @@ export default function PrinterDetailPage({
           ) : (
             <ul className="divide-y divide-separator/50">
               {jobs.map((j) => (
-                <JobRow key={j.id} job={j} onCancel={() => void cancel(j)} />
+                <JobRow
+                  key={j.id}
+                  job={j}
+                  onCancel={() => void cancel(j)}
+                  onReprint={() => void reprint(j)}
+                  onRetry={() => void retry(j)}
+                />
               ))}
             </ul>
           )}
+          {total > PAGE_SIZE ? (
+            <div className="flex items-center justify-between border-t border-separator/50 px-3 py-2">
+              <Button
+                isDisabled={offset === 0}
+                size="sm"
+                variant="ghost"
+                onPress={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}
+              >
+                <ArrowLeftIcon size={15} />
+              </Button>
+              <span className="mono text-[11px] text-muted">
+                {offset + 1}–{Math.min(offset + jobs.length, total)} / {total}
+              </span>
+              <Button
+                isDisabled={offset + PAGE_SIZE >= total}
+                size="sm"
+                variant="ghost"
+                onPress={() => setOffset((o) => o + PAGE_SIZE)}
+              >
+                <ChevronRightIcon size={15} />
+              </Button>
+            </div>
+          ) : null}
         </section>
 
         <section className="space-y-4 self-start rounded-2xl border border-separator/60 bg-surface/60 p-4">
@@ -293,6 +403,25 @@ export default function PrinterDetailPage({
             )}
           </div>
 
+          {paperSizes.length > 1 ? (
+            <div className="flex items-center gap-1.5">
+              {paperSizes.map((p) => (
+                <button
+                  className={`flex-1 rounded-lg border px-2 py-1.5 text-xs transition ${
+                    paper === p
+                      ? "border-accent/60 bg-accent/10 font-medium text-accent"
+                      : "border-separator/70 text-muted hover:border-accent/40"
+                  }`}
+                  key={p}
+                  onClick={() => setPaper(p)}
+                  type="button"
+                >
+                  {p}
+                </button>
+              ))}
+            </div>
+          ) : null}
+
           <div className="flex items-center gap-2">
             <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-default/50 text-muted">
               <ListIcon size={16} />
@@ -337,15 +466,29 @@ export default function PrinterDetailPage({
             </span>
           </div>
 
-          <Button
-            fullWidth
-            isDisabled={!file || submitting || offline}
-            size="lg"
-            onPress={() => void submit()}
-          >
+          <Button fullWidth isDisabled={!file || submitting || offline} size="lg" onPress={() => void submit()}>
             <PrinterIcon size={18} />
             打印
           </Button>
+
+          {activeJob?.progress ? (
+            <div className="space-y-1.5 border-t border-separator/60 pt-3">
+              <div className="flex items-center justify-between text-[11px] text-muted">
+                <span>正在打印</span>
+                <span className="mono">
+                  {activeJob.progress.printed}/{activeJob.progress.total}
+                </span>
+              </div>
+              <div className="h-1.5 overflow-hidden rounded-full bg-default/60">
+                <div
+                  className="h-full rounded-full bg-accent transition-all"
+                  style={{
+                    width: `${Math.min(100, Math.round((activeJob.progress.printed / Math.max(1, activeJob.progress.total)) * 100))}%`,
+                  }}
+                />
+              </div>
+            </div>
+          ) : null}
         </section>
       </div>
     </div>
@@ -367,26 +510,53 @@ function StateChip({status}: {status: PrinterDetail["status"]}) {
   );
 }
 
-// "就绪" and "正在打印" describe normal operation; anything else the backend
-// reports is a condition the user has to act on.
 function isProblem(message?: string) {
   return !!message && !["就绪", "正在打印", "未知"].includes(message);
 }
 
-function JobRow({job, onCancel}: {job: Job; onCancel: () => void}) {
+function JobRow({
+  job,
+  onCancel,
+  onRetry,
+  onReprint,
+}: {
+  job: Job;
+  onCancel: () => void;
+  onRetry: () => void;
+  onReprint: () => void;
+}) {
   const st = jobStatus[job.status] ?? {label: job.status, tone: "text-muted"};
   const active = ["queued", "claimed", "printing"].includes(job.status);
+  const progress = job.progress;
+  const pct = progress ? Math.min(100, Math.round((progress.printed / Math.max(1, progress.total)) * 100)) : 0;
   return (
     <li className="flex items-center gap-3 px-4 py-3">
       <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-default/40 text-muted">
         <FileIcon size={17} />
       </span>
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sm">{job.file_name || "打印文件"}</div>
+        <div className="flex items-center gap-1.5">
+          <span className="truncate text-sm">{job.file_name || "打印文件"}</span>
+          {job.retry_of ? (
+            <span className="shrink-0 rounded bg-default/60 px-1 py-px text-[10px] text-muted">
+              <RetryIcon size={10} />
+            </span>
+          ) : null}
+        </div>
         <div className="mono mt-0.5 truncate text-[11px] text-muted">
           {job.page_range ? `${job.page_range} · ` : ""}
           {job.total_pages} 页 × {job.copies} · {fmt.date(job.created_at)}
         </div>
+        {job.status === "printing" && progress ? (
+          <div className="mt-1.5 flex items-center gap-2">
+            <div className="h-1 w-24 overflow-hidden rounded-full bg-default/50">
+              <div className="h-full rounded-full bg-accent transition-all" style={{width: `${pct}%`}} />
+            </div>
+            <span className="mono text-[10px] text-muted">
+              {progress.printed}/{progress.total}
+            </span>
+          </div>
+        ) : null}
         {job.error_message && job.status !== "completed" ? (
           <div className="mt-0.5 truncate text-[11px] text-danger" title={job.error_message}>
             {job.error_message}
@@ -394,18 +564,39 @@ function JobRow({job, onCancel}: {job: Job; onCancel: () => void}) {
         ) : null}
       </div>
       <span className={`shrink-0 text-xs ${st.tone}`}>{st.label}</span>
-      {active ? (
-        <button
-          aria-label="取消"
-          className="shrink-0 text-muted/70 transition hover:text-danger"
-          onClick={onCancel}
-          type="button"
-        >
-          <StopIcon size={15} />
-        </button>
-      ) : (
-        <span className="w-[15px] shrink-0" />
-      )}
+      <div className="flex w-8 shrink-0 items-center justify-end">
+        {active ? (
+          <button
+            aria-label="取消"
+            className="text-muted/70 transition hover:text-danger"
+            onClick={onCancel}
+            title="取消"
+            type="button"
+          >
+            <StopIcon size={15} />
+          </button>
+        ) : job.status === "failed" || job.status === "canceled" ? (
+          <button
+            aria-label="重试"
+            className="text-muted/70 transition hover:text-accent"
+            onClick={onRetry}
+            title="重试"
+            type="button"
+          >
+            <RetryIcon size={16} />
+          </button>
+        ) : job.status === "completed" ? (
+          <button
+            aria-label="再打一份"
+            className="text-muted/70 transition hover:text-accent"
+            onClick={onReprint}
+            title="再打一份"
+            type="button"
+          >
+            <RetryIcon size={16} />
+          </button>
+        ) : null}
+      </div>
     </li>
   );
 }

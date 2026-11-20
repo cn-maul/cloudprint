@@ -45,7 +45,17 @@ func (s *Server) handlePrintersPublic(w http.ResponseWriter, r *http.Request) {
 		p.Endpoints = visible
 		out = append(out, p)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"printers": out})
+	// Per-printer active job counts, so the list can show "2 份在等" without
+	// opening each detail page. A failure here must not hide the printers.
+	counts, err := s.Store.PrinterQueueCounts(r.Context())
+	if err != nil {
+		counts = map[string]struct{ Queued, Printing int }{}
+	}
+	queues := make(map[string]map[string]int, len(counts))
+	for id, c := range counts {
+		queues[id] = map[string]int{"queued": c.Queued, "printing": c.Printing}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"printers": out, "queues": queues})
 }
 
 func (s *Server) handleAdminPrinters(w http.ResponseWriter, r *http.Request) {

@@ -1,17 +1,19 @@
 import {useCallback, useEffect, useState} from "react";
 import {Chip, Spinner} from "@heroui/react";
-import {api, printerStateLabel, type Printer} from "../lib/api";
+import {api, printerStateLabel, type Printer, type PrinterQueueCount} from "../lib/api";
 import {ChevronRightIcon, PrinterIcon} from "../components/Icon";
 
 export default function PrintersPage({onOpen}: {onOpen: (id: string) => void}) {
   const [printers, setPrinters] = useState<Printer[]>([]);
+  const [queues, setQueues] = useState<Record<string, PrinterQueueCount>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const load = useCallback(async () => {
     try {
-      const r = await api<{printers: Printer[]}>("/api/printers");
+      const r = await api<{printers: Printer[]; queues?: Record<string, PrinterQueueCount>}>("/api/printers");
       setPrinters((r.printers ?? []).map((p) => ({...p, endpoints: p.endpoints ?? []})));
+      setQueues(r.queues ?? {});
       setError("");
     } catch (e) {
       setError(e instanceof Error ? e.message : "载入失败");
@@ -55,13 +57,21 @@ export default function PrintersPage({onOpen}: {onOpen: (id: string) => void}) {
   return (
     <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
       {printers.map((p) => (
-        <PrinterCard key={p.id} printer={p} onOpen={() => onOpen(p.id)} />
+        <PrinterCard key={p.id} printer={p} queue={queues[p.id]} onOpen={() => onOpen(p.id)} />
       ))}
     </div>
   );
 }
 
-function PrinterCard({printer, onOpen}: {printer: Printer; onOpen: () => void}) {
+function PrinterCard({
+  printer,
+  queue,
+  onOpen,
+}: {
+  printer: Printer;
+  queue?: PrinterQueueCount;
+  onOpen: () => void;
+}) {
   const ep = (printer.endpoints ?? []).find((e) => e.kind === "cups") ?? printer.endpoints?.[0];
   const state = ep?.capabilities?.state ?? "";
   const healthy = ep?.health_status === "healthy";
@@ -102,9 +112,18 @@ function PrinterCard({printer, onOpen}: {printer: Printer; onOpen: () => void}) 
             {label}
           </span>
         </Chip>
-        {printer.network_address ? (
-          <span className="mono truncate text-[11px] text-muted/80">{printer.network_address}</span>
-        ) : null}
+        <div className="flex min-w-0 items-center gap-2">
+          {queue && queue.queued + queue.printing > 0 ? (
+            <span className="mono shrink-0 rounded-md bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">
+              {queue.printing > 0 ? `${queue.printing} 打印` : ""}
+              {queue.printing > 0 && queue.queued > 0 ? " · " : ""}
+              {queue.queued > 0 ? `${queue.queued} 等待` : ""}
+            </span>
+          ) : null}
+          {printer.network_address ? (
+            <span className="mono truncate text-[11px] text-muted/80">{printer.network_address}</span>
+          ) : null}
+        </div>
       </div>
     </button>
   );

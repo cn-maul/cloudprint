@@ -98,6 +98,8 @@ export type Job = {
   updated_at: string;
   started_at?: string;
   finished_at?: string;
+  progress?: {printed: number; total: number};
+  retry_of?: string;
 };
 
 export type Candidate = {
@@ -193,6 +195,24 @@ export type PrinterDetail = {
   status: PrinterStatus;
   jobs: Job[];
   total: number;
+  limit: number;
+  offset: number;
+};
+
+export type PrinterQueueCount = {queued: number; printing: number};
+
+export type PrinterOptions = {
+  printer_id: string;
+  model: string;
+  reachable: boolean;
+  paper_sizes: string[];
+  copies_max: number;
+  can_duplex: boolean;
+  can_color: boolean;
+  accepts_pdf: boolean;
+  sides: string[];
+  media: string[];
+  operations: number[];
 };
 
 export type DashboardData = {

@@ -63,6 +63,14 @@ func (s *Server) handlePrinterDetail(w http.ResponseWriter, r *http.Request) {
 		s.jsonError(w, err)
 		return
 	}
+	// Progress is only meaningful for the one job a printer is currently
+	// working on, so ask the device for it here instead of making the browser
+	// poll each job separately. Every other row costs nothing.
+	for i := range jobs {
+		if jobs[i].Status == "printing" {
+			s.fillJobProgress(r.Context(), &jobs[i])
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"printer": p,
 		"status":  status,

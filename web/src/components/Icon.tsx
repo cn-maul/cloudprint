@@ -209,3 +209,17 @@ export function CheckIcon({size = 16}: {size?: number}) {
     </svg>
   );
 }
+
+export function RetryIcon({size = 18}: {size?: number}) {
+  return (
+    <svg fill="none" height={size} viewBox="0 0 24 24" width={size}>
+      <path
+        d="M4 12a8 8 0 0 1 13.7-5.6L20 8.5M20 4v5h-5M20 12a8 8 0 0 1-13.7 5.6L4 15.5M4 20v-5h5"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.7"
+      />
+    </svg>
+  );
+}
