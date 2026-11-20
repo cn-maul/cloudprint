@@ -444,6 +444,22 @@ func (s *Store) CancelSubmittedJob(ctx context.Context, id, code, message string
 	return err
 }
 
+// CancelPrintingJobs marks a printer's in-flight jobs canceled after the device
+// dropped them (a purge). Without this, the job worker keeps polling a job the
+// device no longer knows about and the printer's single active slot stays
+// occupied, blocking every later upload.
+func (s *Store) CancelPrintingJobs(ctx context.Context, printerID, reason string) (int, error) {
+	res, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = 'canceled',
+		error_code = 'PURGED', error_message = ?, finished_at = ?, updated_at = ?
+		WHERE printer_id = ? AND status IN ('claimed','printing')`,
+		truncate(reason, 1000), Now(), Now(), printerID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 func (s *Store) HasActiveJob(ctx context.Context, printerID string) (bool, error) {
 	var n int
 	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM print_jobs

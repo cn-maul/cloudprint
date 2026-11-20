@@ -86,6 +86,14 @@ func (w *Worker) pollCUPS(ctx context.Context) {
 		}
 		pctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 		state, reasons, err := w.Server.CUPS.DeviceJobState(pctx, queue, jobRef, job.ID)
+		// Ask for the device's own sheet counter while the job is still in
+		// flight. It is published with the job event so the queue can show
+		// "3/8" instead of an indefinite "printing".
+		if state == "pending" || state == "processing" {
+			if done, total, ok := w.Server.CUPS.DeviceJobProgress(pctx, queue, jobRef); ok {
+				w.publishProgress(ctx, &job, done, total)
+			}
+		}
 		// A job's own state-reasons only say "job-queued" while the printer is
 		// out of paper. The blocking condition (media-empty, media-jam, ...)
 		// lives on the printer object, so merge both before explaining a stall.
@@ -170,6 +178,23 @@ func (w *Worker) pollCUPS(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// publishProgress attaches the device's impression counter to the job and
+// pushes it to subscribers. It only runs for jobs that are still in flight, and
+// it never changes the stored status.
+func (w *Worker) publishProgress(ctx context.Context, job *store.Job, done, total int) {
+	if job.TotalPages > 0 && total <= 0 {
+		total = job.TotalPages
+	}
+	if total < done {
+		total = done
+	}
+	if done < 0 {
+		done = 0
+	}
+	job.Progress = &store.JobProgress{Printed: done, Total: total}
+	w.Server.Hub.Publish(job.UserID, "job.printing", job)
 }
 
 // stallTimeout is how long a job may sit queued or processing without the

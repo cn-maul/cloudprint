@@ -165,7 +165,9 @@ func (c *Client) GetJobAttributes(ctx context.Context, jobURI string) (*Message,
 		attr("requested-attributes", ValueKeyword,
 			text(ValueKeyword, "job-state"), text(ValueKeyword, "job-state-reasons"),
 			text(ValueKeyword, "job-name"),
-			text(ValueKeyword, "job-impressions-completed")),
+			text(ValueKeyword, "job-impressions-completed"),
+			text(ValueKeyword, "job-impressions"),
+			text(ValueKeyword, "job-media-sheets-completed")),
 	)
 	return c.roundTrip(ctx, OpGetJobAttributes, []Group{g}, nil)
 }
@@ -189,6 +191,50 @@ func (c *Client) CancelJob(ctx context.Context, jobID int32, userName string) er
 		attr("requesting-user-name", ValueNameWithoutLang, text(ValueNameWithoutLang, userName)),
 	)
 	_, err := c.roundTrip(ctx, OpCancelJob, []Group{g}, nil)
+	return err
+}
+
+// PausePrinter stops the device from claiming new jobs. It is how an operator
+// parks a broken printer without walking over to it, so queued documents stay
+// queued instead of failing one after another.
+func (c *Client) PausePrinter(ctx context.Context, userName string) error {
+	if strings.TrimSpace(userName) == "" {
+		userName = "cloudprint"
+	}
+	g := c.operationGroup(
+		attr("printer-uri", ValueURI, text(ValueURI, c.PrinterURI)),
+		attr("requesting-user-name", ValueNameWithoutLang, text(ValueNameWithoutLang, userName)),
+	)
+	_, err := c.roundTrip(ctx, OpPausePrinter, []Group{g}, nil)
+	return err
+}
+
+// ResumePrinter clears the paused state after the paper jam or empty tray has
+// been dealt with.
+func (c *Client) ResumePrinter(ctx context.Context, userName string) error {
+	if strings.TrimSpace(userName) == "" {
+		userName = "cloudprint"
+	}
+	g := c.operationGroup(
+		attr("printer-uri", ValueURI, text(ValueURI, c.PrinterURI)),
+		attr("requesting-user-name", ValueNameWithoutLang, text(ValueNameWithoutLang, userName)),
+	)
+	_, err := c.roundTrip(ctx, OpResumePrinter, []Group{g}, nil)
+	return err
+}
+
+// PurgeJobs drops every job the device is holding. After a jam it is common to
+// have a dozen stale documents queued; printing them all once paper returns
+// wastes a ream.
+func (c *Client) PurgeJobs(ctx context.Context, userName string) error {
+	if strings.TrimSpace(userName) == "" {
+		userName = "cloudprint"
+	}
+	g := c.operationGroup(
+		attr("printer-uri", ValueURI, text(ValueURI, c.PrinterURI)),
+		attr("requesting-user-name", ValueNameWithoutLang, text(ValueNameWithoutLang, userName)),
+	)
+	_, err := c.roundTrip(ctx, OpPurgeJobs, []Group{g}, nil)
 	return err
 }
 

@@ -15,6 +15,9 @@ const (
 	OpGetJobs              = 0x000A
 	OpGetJobAttributes     = 0x0009
 	OpCancelJob            = 0x0008
+	OpPausePrinter         = 0x0010
+	OpResumePrinter        = 0x0011
+	OpPurgeJobs            = 0x0012
 	OpPrintJob             = 0x0002
 	OpValidateJob          = 0x0004
 )
@@ -127,6 +130,23 @@ func (m *Message) Int(groupTag byte, name string) (int64, bool) {
 		return int64(v.Int), true
 	}
 	return 0, false
+}
+
+// Integers reads a multi-valued integer/enum attribute such as
+// operations-supported, where each value names one IPP operation the device
+// implements.
+func (m *Message) Integers(groupTag byte, name string) []int64 {
+	a := m.Attr(groupTag, name)
+	if a == nil {
+		return nil
+	}
+	out := make([]int64, 0, len(a.Values))
+	for _, v := range a.Values {
+		if v.Tag == ValueInteger || v.Tag == ValueEnum {
+			out = append(out, int64(v.Int))
+		}
+	}
+	return out
 }
 
 // Resolution reads a resolution value (cross-feed and feed direction DPI) and

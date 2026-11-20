@@ -42,6 +42,7 @@ func (s *Server) handlePrinterOptions(w http.ResponseWriter, r *http.Request) {
 	caps := store.Capabilities{}
 	model := p.Model
 	reachable := false
+	supportedOps := []int64{}
 	for i := range p.Endpoints {
 		ep := &p.Endpoints[i]
 		if !ep.IsEnabled || ep.Kind == "socket" {
@@ -75,6 +76,7 @@ func (s *Server) handlePrinterOptions(w http.ResponseWriter, r *http.Request) {
 			"printer-make-and-model", "document-format-supported",
 			"sides-supported", "media-supported", "media-default",
 			"print-color-mode-supported", "copies-supported", "printer-state",
+			"operations-supported",
 		})
 		if cerr != nil {
 			continue
@@ -110,6 +112,9 @@ func (s *Server) handlePrinterOptions(w http.ResponseWriter, r *http.Request) {
 		if live.MakeModel != "" {
 			model = live.MakeModel
 		}
+		if ops := msg.Integers(ipp.TagPrinterAttributes, "operations-supported"); len(ops) > 0 {
+			supportedOps = ops
+		}
 		break
 	}
 
@@ -130,6 +135,10 @@ func (s *Server) handlePrinterOptions(w http.ResponseWriter, r *http.Request) {
 		"accepts_pdf": caps.SupportsPDF(),
 		"sides":       caps.Sides,
 		"media":       caps.Media,
+		// Pause/Resume/Purge are optional IPP operations. Many small devices
+		// (this Pantum included) answer them with 0x0501, so the client must be
+		// able to tell whether the buttons would do anything.
+		"operations": supportedOps,
 	})
 }
 

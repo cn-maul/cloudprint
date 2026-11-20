@@ -266,7 +266,33 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "FORBIDDEN", "无权查看该任务")
 		return
 	}
+	// A single-job view is polled while the document prints, so it is the right
+	// place to ask the device how many sheets are done. List views skip this:
+	// one IPP round trip per row would make the queue slow.
+	s.fillJobProgress(r.Context(), job)
 	writeJSON(w, http.StatusOK, job)
+}
+
+// fillJobProgress adds the device's impression counter to an in-flight job.
+// It is best-effort: an unreachable device leaves progress empty rather than
+// failing the request.
+func (s *Server) fillJobProgress(ctx context.Context, job *store.Job) {
+	if job == nil || job.Status != "printing" || job.CUPSJobID == "" || job.QueueName == "" || s.CUPS == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	done, total, ok := s.CUPS.DeviceJobProgress(ctx, job.QueueName, job.CUPSJobID)
+	if !ok {
+		return
+	}
+	if total <= 0 {
+		total = job.TotalPages
+	}
+	if total < done {
+		total = done
+	}
+	job.Progress = &store.JobProgress{Printed: done, Total: total}
 }
 
 func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {

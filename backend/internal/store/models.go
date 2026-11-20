@@ -202,6 +202,15 @@ type Job struct {
 	PDFPath      string `json:"-"`
 	QueueName    string `json:"queue_name,omitempty"`
 	CUPSJobID    string `json:"cups_job_id,omitempty"`
+	// Progress is filled in by the API for in-flight jobs from the device's
+	// own impression counter. It is not stored: the device is the only
+	// authority on how much paper has actually come out.
+	Progress *JobProgress `json:"progress,omitempty"`
+}
+
+type JobProgress struct {
+	Printed int `json:"printed"`
+	Total   int `json:"total"`
 }
 
 type DiscoveryRun struct {

@@ -723,6 +723,42 @@ func (c *Client) DeviceJobState(ctx context.Context, queue, jobURI, jobName stri
 	return "unknown", reasons, nil
 }
 
+// DeviceJobProgress reports how many impressions the device has finished for
+// a job.
+//
+// "printing" is a long and opaque state on a slow device. The queue can only
+// say "正在打印" for many minutes, which looks like a hang; this returns the
+// device's own counter so the page shows 2/4 instead. Impressions are sheets,
+// not PDF pages, so copies and duplex change the divisor — the caller stores
+// the target it asked for.
+func (c *Client) DeviceJobProgress(ctx context.Context, queue, jobURI string) (done int, total int, ok bool) {
+	jobURI = strings.TrimSpace(jobURI)
+	if jobURI == "" {
+		return 0, 0, false
+	}
+	deviceURI, err := c.DeviceURI(ctx, queue)
+	if err != nil {
+		return 0, 0, false
+	}
+	client, err := ipp.NewClient(deviceURI, 8*time.Second)
+	if err != nil {
+		return 0, 0, false
+	}
+	msg, err := client.GetJobAttributes(ctx, jobURI)
+	if err != nil {
+		return 0, 0, false
+	}
+	finished, hasDone := msg.Int(ipp.TagJobAttributes, "job-impressions-completed")
+	expected, hasTotal := msg.Int(ipp.TagJobAttributes, "job-impressions")
+	if !hasDone {
+		return 0, 0, false
+	}
+	if !hasTotal || expected <= 0 {
+		expected = 0
+	}
+	return int(finished), int(expected), true
+}
+
 // DeviceURI resolves the ipp:// address a CUPS queue prints to. CloudPrint
 // uses it to bypass cupsd: the spooler still knows where the printer is, but
 // it no longer handles the document.
@@ -780,6 +816,29 @@ func (c *Client) CancelDeviceJob(ctx context.Context, queue string, jobID int32,
 		return err
 	}
 	return client.CancelJob(ctx, jobID, userName)
+}
+
+// DeviceControl runs a printer-level IPP operation (pause/resume/purge)
+// against the hardware behind a queue. cupsd cannot do this for us: the queued
+// documents live on the device, not in the local spooler.
+func (c *Client) DeviceControl(ctx context.Context, queue, action, userName string) error {
+	deviceURI, err := c.DeviceURI(ctx, queue)
+	if err != nil {
+		return err
+	}
+	client, err := ipp.NewClient(deviceURI, 15*time.Second)
+	if err != nil {
+		return err
+	}
+	switch action {
+	case "pause":
+		return client.PausePrinter(ctx, userName)
+	case "resume":
+		return client.ResumePrinter(ctx, userName)
+	case "purge":
+		return client.PurgeJobs(ctx, userName)
+	}
+	return fmt.Errorf("不支持的操作 %q", action)
 }
 
 type PPD struct {
