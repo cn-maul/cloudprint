@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"cloudprint/internal/store"
+	"cloudprint/internal/support"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -43,6 +44,9 @@ func (s *Server) handlePrintersPublic(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		p.Endpoints = visible
+		// Records created before the whitelist kept the device's spelling
+		// ("MS6000NW series"); show the one canonical name everywhere.
+		p.Model = support.Canonical(p.Model)
 		out = append(out, p)
 	}
 	// Per-printer active job counts, so the list can show "2 份在等" without
@@ -64,6 +68,9 @@ func (s *Server) handleAdminPrinters(w http.ResponseWriter, r *http.Request) {
 		s.jsonError(w, err)
 		return
 	}
+	for i := range printers {
+		printers[i].Model = support.Canonical(printers[i].Model)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"printers": printers})
 }
 
@@ -80,6 +87,13 @@ func (s *Server) handleCreatePrinter(w http.ResponseWriter, r *http.Request) {
 	var in store.NewPrinter
 	if !decodeJSON(w, r, &in) {
 		return
+	}
+	if !support.Supported(in.Model) {
+		writeErr(w, http.StatusConflict, "MODEL_UNSUPPORTED", support.RejectMessage(in.Model))
+		return
+	}
+	if m, ok := support.Match(in.Model); ok {
+		in.Model = m.Name
 	}
 	p, err := s.Store.CreatePrinter(r.Context(), in)
 	if err != nil {
@@ -103,6 +117,19 @@ func (s *Server) handleUpdatePrinter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := chi.URLParam(r, "id")
+	// Editing the model is how a mis-detected device gets corrected, but it is
+	// also a way to launder an unsupported printer into the printable set:
+	// jobs only look at the stored model. Accept a value only if it names a
+	// model on the list, and store the canonical name.
+	if in.Model != nil {
+		m, ok := support.Match(*in.Model)
+		if !ok {
+			writeErr(w, http.StatusConflict, "MODEL_UNSUPPORTED", support.RejectMessage(*in.Model))
+			return
+		}
+		name := m.Name
+		in.Model = &name
+	}
 	if err := s.Store.UpdatePrinter(r.Context(), id, in.DisplayName, in.Location,
 		in.Vendor, in.Model, in.ProfileID, in.IsEnabled); err != nil {
 		s.jsonError(w, err)
@@ -129,8 +156,17 @@ func (s *Server) handleCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	printerID := chi.URLParam(r, "id")
-	if _, err := s.Store.GetPrinter(r.Context(), printerID); err != nil {
+	p, err := s.Store.GetPrinter(r.Context(), printerID)
+	if err != nil {
 		writeErr(w, http.StatusNotFound, "PRINTER_NOT_FOUND", "打印机不存在")
+		return
+	}
+	// Endpoints are what makes a printer printable. Adding one to a model that
+	// never passed the whitelist would revive the very device the add path
+	// refuses.
+	if !support.Supported(firstNonEmpty(p.Model, p.DisplayName)) {
+		writeErr(w, http.StatusConflict, "MODEL_UNSUPPORTED",
+			support.RejectMessage(firstNonEmpty(p.Model, p.DisplayName)))
 		return
 	}
 	in.URI = strings.TrimSpace(in.URI)

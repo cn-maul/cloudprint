@@ -9,6 +9,7 @@ import (
 	"cloudprint/internal/cups"
 	"cloudprint/internal/ipp"
 	"cloudprint/internal/store"
+	"cloudprint/internal/support"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -150,8 +151,12 @@ func (s *Server) handleCUPSConnect(w http.ResponseWriter, r *http.Request) {
 		if msg, err := c.GetPrinterAttributes(probeCtx, []string{
 			"printer-make-and-model", "document-format-supported",
 		}); err == nil {
-			if mm := strings.TrimSpace(msg.String(ipp.TagPrinterAttributes, "printer-make-and-model")); mm != "" && model == "" {
-				model = mm
+			// The device is authoritative: a form field can say anything, and
+			// the whitelist must judge the hardware that receives the jobs.
+			if mm := strings.TrimSpace(msg.String(ipp.TagPrinterAttributes, "printer-make-and-model")); mm != "" {
+				if clean, ok := cleanModelName(mm); ok {
+					model = clean
+				}
 			}
 			for _, f := range msg.Strings(ipp.TagPrinterAttributes, "document-format-supported") {
 				if f == "application/pdf" || f == "*/*" {
@@ -164,11 +169,25 @@ func (s *Server) handleCUPSConnect(w http.ResponseWriter, r *http.Request) {
 	if model != "" || vendor != "" {
 		_ = s.Store.UpdatePrinter(r.Context(), p.ID, nil, nil, &vendor, &model, nil, nil)
 	}
+	// Same whitelist as the one-click path: this route can create a printer
+	// too, so it must not become a way around the supported-model list.
+	listed, ok := support.Match(model)
+	if !ok {
+		cleanup()
+		writeErr(w, http.StatusConflict, "MODEL_UNSUPPORTED", support.RejectMessage(model))
+		return
+	}
+	model = listed.Name
 
 	ppdPath := strings.TrimSpace(in.PPD)
 	var driver cups.PPD
 	if ppdPath == "" {
-		if best := s.CUPS.MatchPPD(model); best != nil {
+		// Prefer the driver the whitelist says was tested with this model;
+		// the fuzzy match can land on a sibling model's PPD.
+		if best := s.CUPS.PreferredPPD(listed.DriverHint()); best != nil {
+			driver = *best
+			ppdPath = best.Path
+		} else if best := s.CUPS.MatchPPD(model); best != nil {
 			driver = *best
 			ppdPath = best.Path
 		}

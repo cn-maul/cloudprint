@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"net"
+	"os"
 	"strings"
 )
 
@@ -42,10 +43,32 @@ func SuggestCIDRs(configured, printerHosts []string, clientIP string) []Candidat
 	if ip := net.ParseIP(strings.TrimSpace(clientIP)); ip != nil && ip.To4() != nil && !ip.IsLoopback() {
 		add(hostSubnet(ip.To4()), "你当前的网段")
 	}
-	for _, cidr := range LocalCIDRs() {
-		add(cidr, "服务器所在网段")
+	// Inside Docker the only attached network is the bridge, which never
+	// contains a printer. Offering it makes the picker look broken, so rely on
+	// the caller's own address and existing printers instead.
+	if !InContainer() {
+		for _, cidr := range LocalCIDRs() {
+			add(cidr, "服务器所在网段")
+		}
 	}
 	return out
+}
+
+// InContainer reports whether this process runs inside a container, where the
+// host's LAN interfaces are not visible.
+func InContainer() bool {
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	if b, err := os.ReadFile("/proc/1/cgroup"); err == nil {
+		s := string(b)
+		for _, marker := range []string{"docker", "kubepods", "containerd", "lxc"} {
+			if strings.Contains(s, marker) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hostSubnet turns an address into the /24 that most office LANs use. Scanning

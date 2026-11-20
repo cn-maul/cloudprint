@@ -147,6 +147,7 @@ func (s *Server) Routes() http.Handler {
 				r.Post("/admin/discover", s.handleDiscover)
 				r.Get("/admin/scan-targets", s.handleScanTargets)
 				r.Post("/admin/printers/quick-add", s.handleQuickAddPrinter)
+				r.Get("/admin/supported-models", s.handleSupportedModels)
 				r.Get("/admin/discovery-runs", s.handleDiscoveryRuns)
 				r.Get("/admin/cups/queues", s.handleCUPSQueues)
 				r.Get("/admin/cups/drivers", s.handleCUPSDrivers)

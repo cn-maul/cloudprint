@@ -98,7 +98,19 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "NO_PREVIEW", "该文件没有预览")
 		return
 	}
-	img, err := s.Pipeline.Preview(r.Context(), f.StoragePath, f.ID)
+	// "page" lets the detail page flip through the document. The response is
+	// still one page per request so a 200-page PDF does not render 200 PNGs
+	// before the first image can be shown.
+	page := 1
+	if v := r.URL.Query().Get("page"); v != "" {
+		n, convErr := strconv.Atoi(v)
+		if convErr != nil || n < 1 || n > f.PageCount {
+			writeErr(w, http.StatusBadRequest, "PAGE_INVALID", "页码超出文件范围")
+			return
+		}
+		page = n
+	}
+	img, err := s.Pipeline.Preview(r.Context(), f.StoragePath, f.ID, page)
 	if err != nil {
 		writeErr(w, http.StatusServiceUnavailable, "PREVIEW_UNAVAILABLE", err.Error())
 		return

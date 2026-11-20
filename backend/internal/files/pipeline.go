@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -237,12 +238,18 @@ func (p *Pipeline) imageToPDF(input, hash, mime string) (string, error) {
 	return out, nil
 }
 
-func (p *Pipeline) Preview(ctx context.Context, pdfPath, fileID string) (string, error) {
+// Preview renders one page of a PDF as a PNG. The page is part of the cache
+// key: without it, flipping to page 2 of a short document would silently show
+// page 1 again because the first render already exists on disk.
+func (p *Pipeline) Preview(ctx context.Context, pdfPath, fileID string, page int) (string, error) {
 	outDir := filepath.Join(p.Root, "previews")
 	if err := os.MkdirAll(outDir, 0o750); err != nil {
 		return "", err
 	}
-	out := filepath.Join(outDir, fileID+".png")
+	if page < 1 {
+		page = 1
+	}
+	out := filepath.Join(outDir, fmt.Sprintf("%s-p%d.png", fileID, page))
 	if _, err := os.Stat(out); err == nil {
 		return out, nil
 	}
@@ -251,8 +258,9 @@ func (p *Pipeline) Preview(ctx context.Context, pdfPath, fileID string) (string,
 	}
 	pctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
-	prefix := filepath.Join(outDir, fileID+"-p")
-	cmd := exec.CommandContext(pctx, p.PDFToPPM, "-f", "1", "-l", "1", "-scale-to", "900", "-png", pdfPath, prefix)
+	prefix := filepath.Join(outDir, fmt.Sprintf("%s-p%d-", fileID, page))
+	cmd := exec.CommandContext(pctx, p.PDFToPPM, "-f", strconv.Itoa(page), "-l", strconv.Itoa(page),
+		"-scale-to", "900", "-png", pdfPath, prefix)
 	if _, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("生成预览失败")
 	}

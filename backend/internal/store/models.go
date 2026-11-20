@@ -153,8 +153,13 @@ type Candidate struct {
 	// devices that are already registered.
 	AlreadyAdded bool   `json:"already_added"`
 	PrinterName  string `json:"printer_name,omitempty"`
-	FirstSeenAt  string `json:"first_seen_at"`
-	LastSeenAt   string `json:"last_seen_at"`
+	// Supported / UnsupportedReason are filled in by the API from the model
+	// whitelist. A discovered device that is not on the list is still shown,
+	// so the admin can see it exists, but it cannot be added.
+	Supported         bool   `json:"supported"`
+	UnsupportedReason string `json:"unsupported_reason,omitempty"`
+	FirstSeenAt       string `json:"first_seen_at"`
+	LastSeenAt        string `json:"last_seen_at"`
 }
 
 type StoredFile struct {

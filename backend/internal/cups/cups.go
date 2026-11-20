@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -274,14 +275,22 @@ func (c *Client) Create(ctx context.Context, opt CreateOptions) error {
 	if strings.TrimSpace(opt.DeviceURI) == "" {
 		return errors.New("设备地址不能为空")
 	}
-	if opt.PPD != "" {
+	// A PPD is either a file on disk (/usr/share/cups/model/...) or a model
+	// name served by a CUPS driver program (openprinting-ppds:0/ppd/...).
+	// Only the former can be stat'ed; the latter must be passed to -m.
+	modelScheme := opt.PPD != "" && !strings.HasPrefix(opt.PPD, "/")
+	if opt.PPD != "" && !modelScheme {
 		if _, err := os.Stat(opt.PPD); err != nil {
 			return fmt.Errorf("找不到 PPD 文件 %s", opt.PPD)
 		}
 	}
 	args := []string{"-p", opt.Name, "-E", "-v", opt.DeviceURI}
 	if opt.PPD != "" {
-		args = append(args, "-P", opt.PPD)
+		if modelScheme {
+			args = append(args, "-m", opt.PPD)
+		} else {
+			args = append(args, "-P", opt.PPD)
+		}
 	} else {
 		args = append(args, "-m", "everywhere")
 	}
@@ -759,19 +768,44 @@ func (c *Client) DeviceJobProgress(ctx context.Context, queue, jobURI string) (d
 	return int(finished), int(expected), true
 }
 
-// DeviceURI resolves the ipp:// address a CUPS queue prints to. CloudPrint
-// uses it to bypass cupsd: the spooler still knows where the printer is, but
-// it no longer handles the document.
+// DeviceURI resolves the address a CUPS queue prints to. CloudPrint uses it to
+// bypass cupsd: the spooler still knows where the printer is, but it no longer
+// handles the document.
 func (c *Client) DeviceURI(ctx context.Context, queue string) (string, error) {
 	uri, err := c.deviceURIIPP(ctx, queue)
 	if err != nil {
 		return "", err
 	}
 	uri = strings.TrimSpace(uri)
-	if !strings.HasPrefix(uri, "ipp://") && !strings.HasPrefix(uri, "ipps://") {
-		return "", fmt.Errorf("队列 %q 的地址 %q 不是 IPP", queue, uri)
+	// IPP is the normal case; socket:// (RAW 9100) is how a printer without
+	// IPP is reached. Both can be written to, but only IPP can report job
+	// state, so the caller treats them differently.
+	if !strings.HasPrefix(uri, "ipp://") && !strings.HasPrefix(uri, "ipps://") &&
+		!strings.HasPrefix(uri, "socket://") && !strings.HasPrefix(uri, "lpd://") {
+		return "", fmt.Errorf("队列 %q 的地址 %q 无法直接访问", queue, uri)
 	}
 	return uri, nil
+}
+
+// SocketAddress extracts host:port from a socket:// device URI.
+func SocketAddress(uri string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(uri))
+	if err != nil || (u.Scheme != "socket" && u.Scheme != "lpd") {
+		return "", false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", false
+	}
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "lpd" {
+			port = "515"
+		} else {
+			port = "9100"
+		}
+	}
+	return net.JoinHostPort(host, port), true
 }
 
 // deviceURIIPP reads a queue's device-uri attribute from cupsd. CUPS exposes
@@ -869,8 +903,11 @@ func (c *Client) PPDs() []PPD {
 	if c.ppds != nil && time.Since(c.ppdsRead) < 5*time.Minute {
 		return c.ppds
 	}
-	var out []PPD
+	out := c.driverModels()
 	seen := map[string]bool{}
+	for _, p := range out {
+		seen[p.Path] = true
+	}
 	for _, dir := range ppdDirs() {
 		_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 			if err != nil || d.IsDir() {
@@ -895,6 +932,52 @@ func (c *Client) PPDs() []PPD {
 	c.ppds = out
 	c.ppdsRead = time.Now()
 	return out
+}
+
+// driverModels lists the models CUPS itself offers through its driver
+// programs. Debian ships most printers this way: the PPDs live inside
+// /usr/lib/cups/driver/openprinting-ppds (a 7 MB index) instead of on disk, so
+// walking the model directories alone finds only the handful of unpacked
+// files and every HP/Brother/Epson device looks like it has no driver.
+//
+// `lpinfo -m` is the authoritative list; it also includes PPDs on disk, which
+// are skipped here and picked up by the directory walk.
+func (c *Client) driverModels() []PPD {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	lpinfo, err := exec.LookPath("lpinfo")
+	if err != nil {
+		return nil
+	}
+	out, err := c.run(ctx, lpinfo, "-m")
+	if err != nil {
+		return nil
+	}
+	var list []PPD
+	seen := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		// "<scheme>:<path> <human name>"
+		line = strings.TrimSpace(line)
+		i := strings.IndexByte(line, ' ')
+		if i <= 0 {
+			continue
+		}
+		path, name := line[:i], strings.TrimSpace(line[i+1:])
+		if path == "" || name == "" || seen[path] {
+			continue
+		}
+		// An absolute path is a PPD file on disk; the directory walk below
+		// picks those up (and can read their NickName). Everything else is a
+		// model name served by a driver program and must be kept as-is.
+		if strings.HasPrefix(path, "/") {
+			continue
+		}
+		seen[path] = true
+		// "openprinting-ppds:0/ppd/openprinting/Brother/BR7025_2_GPL.ppd"
+		model := strings.TrimSuffix(filepath.Base(path), ".ppd")
+		list = append(list, PPD{Path: path, Name: name, Model: model})
+	}
+	return list
 }
 
 var rePPDAttr = regexp.MustCompile(`^\*([A-Za-z][A-Za-z0-9_.-]*):\s*"?(.*?)"?\s*$`)
@@ -963,6 +1046,35 @@ func (c *Client) MatchPPD(model string) *PPD {
 		return nil
 	}
 	return best
+}
+
+// PreferredPPD returns the installed driver whose name or path contains hint.
+// A whitelist entry names the one driver that was tested with the hardware;
+// the fuzzy MatchPPD can prefer a sibling model ("MS6000" instead of
+// "MS6000NW") when both are installed, and installing the wrong PPD is the
+// difference between a page and a silent failure.
+func (c *Client) PreferredPPD(hint string) *PPD {
+	hint = strings.ToLower(strings.TrimSpace(hint))
+	if hint == "" {
+		return nil
+	}
+	list := c.PPDs()
+	var fallback *PPD
+	for i := range list {
+		p := &list[i]
+		if !strings.Contains(strings.ToLower(p.Name+" "+p.Path), hint) {
+			continue
+		}
+		// A file on disk is readable and stable; a driver-program model name
+		// works too, but prefer the explicit PPD when both exist.
+		if strings.HasPrefix(p.Path, "/") {
+			return p
+		}
+		if fallback == nil {
+			fallback = p
+		}
+	}
+	return fallback
 }
 
 func normalize(s string) string {

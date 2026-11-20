@@ -2,7 +2,9 @@ package printer
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -32,6 +34,10 @@ type SendResult struct {
 	IPPJobID   int
 	CUPSJobID  string
 	DurationMS int64
+	// Untracked means the device was written to over RAW 9100, which has no
+	// job protocol: there is no id to poll and the job is finished once the
+	// bytes are accepted.
+	Untracked bool
 }
 
 func (e *Executor) PrintIPP(ctx context.Context, ep *store.Endpoint, job *store.Job, pdfPath string) (res SendResult) {
@@ -162,7 +168,7 @@ func (e *Executor) Dispatch(ctx context.Context, job *store.Job) SendResult {
 	}
 	// A raster submit only means the device accepted the job. The worker asks
 	// the device for its verdict until the job leaves its queue.
-	if res.OK && ep.Kind == "cups" {
+	if res.OK && ep.Kind == "cups" && !res.Untracked {
 		return res
 	}
 	_ = e.Store.CompleteJob(ctx, job.ID, ep.ID, res.OK, res.Code, res.Message)
@@ -198,12 +204,25 @@ func (e *Executor) PrintRaster(ctx context.Context, ep *store.Endpoint, job *sto
 		return res
 	}
 	dpi := ep.Capabilities.ResolutionDPI()
+	// A queue bound to RAW 9100 (socket://) has no IPP job protocol. Render
+	// and write the bytes; the device prints them, and there is no id to poll.
+	if addr, ok := cups.SocketAddress(uri); ok {
+		return e.printSocket(ctx, ep, job, pdfPath, uri, addr, dpi)
+	}
 	// A vendor PPD is the authoritative statement of what this device eats.
 	// Prefer it: most network printers here are not IPP Everywhere devices and
 	// reject generic raster with document-format-error.
 	if e.QueuePPD != nil {
 		if ppdPath, _, perr := e.QueuePPD(ctx, queue); perr == nil && ppdPath != "" {
-			return e.printViaDriver(ctx, ep, job, pdfPath, uri, ppdPath, dpi)
+			// A driverless queue ("everywhere" PPD) has no filter of its own;
+			// its device accepts PWG-Raster, which render.PWG produces. Only
+			// try the vendor chain when the PPD actually names one.
+			if render.CanDrive(ppdPath) {
+				res := e.printViaDriver(ctx, ep, job, pdfPath, uri, ppdPath, dpi)
+				if res.Code != "DRIVER_NO_FILTER" {
+					return res
+				}
+			}
 		}
 	}
 	rasterPath := render.OutputName(pdfPath)
@@ -305,6 +324,11 @@ func (e *Executor) printViaDriver(ctx context.Context, ep *store.Endpoint, job *
 	})
 	dcancel()
 	if err != nil {
+		if errors.Is(err, render.ErrNoFilter) {
+			res.Code = "DRIVER_NO_FILTER"
+			res.Message = err.Error()
+			return res
+		}
 		res.Code = "DRIVER_RENDER_FAILED"
 		res.Message = err.Error()
 		e.Store.RecordEndpointEvent(ctx, ep.ID, "render_fail", map[string]any{
@@ -355,6 +379,106 @@ func (e *Executor) printViaDriver(ctx context.Context, ep *store.Endpoint, job *
 	e.Store.RecordEndpointEvent(ctx, ep.ID, "print_ok", map[string]any{
 		"job": job.ID, "device_job": jobURI, "uri": uri, "ms": res.DurationMS,
 		"format": out.Format,
+	})
+	return res
+}
+
+// printSocket writes the rendered device stream straight to a RAW 9100 port.
+//
+// This is the oldest printer protocol and the only one some cheap network
+// printers support. It has no job ids, no status and no cancellation, so a job
+// is done as soon as the bytes are accepted; a paper jam can only be noticed
+// by the person standing next to the printer.
+func (e *Executor) printSocket(ctx context.Context, ep *store.Endpoint, job *store.Job, pdfPath, uri, addr string, dpi int) (res SendResult) {
+	start := time.Now()
+	res = SendResult{Code: "SOCKET_SEND_FAILED", Untracked: true}
+	defer func() { res.DurationMS = time.Since(start).Milliseconds() }()
+
+	var data []byte
+	var format string
+	var cleanup func()
+	if e.QueuePPD != nil {
+		if ppdPath, _, perr := e.QueuePPD(ctx, firstNonEmpty(ep.QueueName, ep.URI)); perr == nil && ppdPath != "" && render.CanDrive(ppdPath) {
+			dctx, dcancel := context.WithTimeout(ctx, 6*time.Minute)
+			out, derr := render.DriverChain(dctx, render.DriverOptions{
+				PDFPath:   pdfPath,
+				PPDPath:   ppdPath,
+				DPI:       dpi,
+				Paper:     job.PaperSize,
+				Copies:    job.Copies,
+				JobID:     job.ID,
+				UserName:  job.Username,
+				Title:     job.FileName,
+				MediaName: ippMedia(job.PaperSize),
+			})
+			dcancel()
+			if derr == nil {
+				data, format = out.Data, out.Format
+				e.Store.RecordEndpointEvent(ctx, ep.ID, "driver_ok", map[string]any{
+					"job": job.ID, "filter": out.Program, "format": out.Format, "bytes": len(out.Data),
+				})
+			} else if !errors.Is(derr, render.ErrNoFilter) {
+				res.Code = "DRIVER_RENDER_FAILED"
+				res.Message = derr.Error()
+				return res
+			}
+		}
+	}
+	if data == nil {
+		// No usable PPD: a RAW port expects the device's own language, and
+		// PWG-Raster is the best generic answer (most modern lasers take it).
+		rasterPath := render.OutputName(pdfPath)
+		rctx, rcancel := context.WithTimeout(ctx, 5*time.Minute)
+		err := render.PWG(rctx, render.Options{
+			PDFPath: pdfPath, OutputPath: rasterPath, DPI: dpi,
+			Paper: job.PaperSize, Copies: job.Copies,
+		})
+		rcancel()
+		if err != nil {
+			res.Code = "RASTER_RENDER_FAILED"
+			res.Message = err.Error()
+			return res
+		}
+		cleanup = func() { _ = os.Remove(rasterPath) }
+		data, err = os.ReadFile(rasterPath)
+		if err != nil {
+			cleanup()
+			res.Code = "RASTER_READ_FAILED"
+			res.Message = "读取光栅文件失败：" + err.Error()
+			return res
+		}
+		format = "image/pwg-raster"
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	d := net.Dialer{Timeout: 15 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		res.Message = "连不上打印机的 9100 端口：" + err.Error()
+		e.Store.RecordEndpointEvent(ctx, ep.ID, "print_fail", map[string]any{
+			"error": res.Message, "job": job.ID, "uri": uri,
+		})
+		return res
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Minute))
+	if _, err := conn.Write(data); err != nil {
+		res.Message = "发送到打印机失败：" + err.Error()
+		e.Store.RecordEndpointEvent(ctx, ep.ID, "print_fail", map[string]any{
+			"error": res.Message, "job": job.ID, "uri": uri,
+		})
+		return res
+	}
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+	res.OK = true
+	res.Code = "OK"
+	res.Message = "已发送到打印机（RAW 9100，无法回读状态）"
+	e.Store.RecordEndpointEvent(ctx, ep.ID, "print_ok", map[string]any{
+		"job": job.ID, "uri": uri, "format": format, "bytes": len(data), "ms": res.DurationMS,
 	})
 	return res
 }

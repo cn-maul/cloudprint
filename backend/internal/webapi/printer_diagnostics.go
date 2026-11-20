@@ -174,9 +174,29 @@ func inspectPPD(path string) diagnosticsFilter {
 		out.Error = "读取 PPD 失败：" + err.Error()
 		return out
 	}
+	switch render.Inspect(string(body)) {
+	case "":
+		out.Error = "这个 PPD 没有可执行的过滤器"
+		return out
+	case "postscript":
+		// A PostScript device has no filter: the job is sent as PS and the
+		// printer's own interpreter renders it.
+		out.Name, out.Source, out.Dest = "postscript", "application/pdf", "application/postscript"
+		if spec, ok := render.PickFilter(render.ParseFilters(string(body))); ok {
+			out.Name, out.Source, out.Dest = spec.Program, spec.Source, spec.Dest
+			if bin, ferr := render.FilterPath(spec.Program); ferr == nil {
+				out.Path, out.Installed = bin, true
+				return out
+			}
+		}
+		if bin, gerr := exec.LookPath("pdftops"); gerr == nil {
+			out.Path, out.Installed = bin, true
+		}
+		return out
+	}
 	spec, ok := render.PickFilter(render.ParseFilters(string(body)))
 	if !ok {
-		out.Error = "这个 PPD 没有可用的光栅过滤器（需要 *cupsFilter 处理 application/vnd.cups-raster）"
+		out.Error = "这个 PPD 没有可执行的过滤器"
 		return out
 	}
 	out.Name, out.Source, out.Dest = spec.Program, spec.Source, spec.Dest

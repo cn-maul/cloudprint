@@ -14,6 +14,7 @@ import (
 	"cloudprint/internal/ipp"
 	"cloudprint/internal/printer"
 	"cloudprint/internal/store"
+	"cloudprint/internal/support"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -43,6 +44,14 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	p, err := s.Store.GetPrinter(r.Context(), in.PrinterID)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "PRINTER_NOT_FOUND", "打印机不存在")
+		return
+	}
+	// Adding a printer is already restricted to the supported-model list, but
+	// a device registered before that list existed (or via an older build)
+	// would otherwise still accept jobs and fail on paper. Refuse up front.
+	if !support.Supported(firstNonEmpty(p.Model, p.DisplayName)) {
+		writeErr(w, http.StatusConflict, "MODEL_UNSUPPORTED",
+			support.RejectMessage(firstNonEmpty(p.Model, p.DisplayName)))
 		return
 	}
 	file, err := s.Store.GetFile(r.Context(), in.FileID)
@@ -408,6 +417,11 @@ func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "PRINTER_DISABLED", "这台打印机已停用")
 		return
 	}
+	if !support.Supported(firstNonEmpty(p.Model, p.DisplayName)) {
+		writeErr(w, http.StatusConflict, "MODEL_UNSUPPORTED",
+			support.RejectMessage(firstNonEmpty(p.Model, p.DisplayName)))
+		return
+	}
 	allowed, err := s.Store.UserCanUsePrinter(r.Context(), u.ID, u.Role, p.ID)
 	if err != nil {
 		s.jsonError(w, err)
@@ -496,6 +510,14 @@ func (s *Server) handleReprintJob(w http.ResponseWriter, r *http.Request) {
 	p, err := s.Store.GetPrinter(r.Context(), src.PrinterID)
 	if err != nil || !p.IsEnabled {
 		writeErr(w, http.StatusConflict, "PRINTER_GONE", "这台打印机已删除或停用")
+		return
+	}
+	// Reprint and retry both create a fresh job; the same whitelist applies as
+	// for an upload, or an old job becomes a way to print from a model that was
+	// never verified.
+	if !support.Supported(firstNonEmpty(p.Model, p.DisplayName)) {
+		writeErr(w, http.StatusConflict, "MODEL_UNSUPPORTED",
+			support.RejectMessage(firstNonEmpty(p.Model, p.DisplayName)))
 		return
 	}
 	file, err := s.Store.GetFile(r.Context(), src.PDFFile)

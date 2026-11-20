@@ -85,6 +85,12 @@ func (s *Store) CreateJob(ctx context.Context, in NewJob) (*Job, error) {
 	if in.PaperSize == "" {
 		in.PaperSize = "A4"
 	}
+	// Only A4 is verified on this build's hardware. Anything else is either
+	// refused by the tray or silently scaled, so reject it here instead of
+	// queuing a job that will not come out as intended.
+	if in.PaperSize != "A4" {
+		return nil, fmt.Errorf("目前只支持 A4 纸")
+	}
 	if in.Pages < 0 || in.Pages > file.PageCount {
 		return nil, fmt.Errorf("页码超出文件范围")
 	}

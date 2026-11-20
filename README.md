@@ -124,6 +124,23 @@ sudo ./deploy/install-pantum-driver.sh
 会报 `execv failed: Permission denied`）。之后在 **打印机 → 添加** 里重新接入，
 系统会按设备上报的型号自动匹配 PPD。
 
+**型号白名单。** 一个品牌里的两台机器可能用完全不同的页面描述语言，所以放行单位
+是型号而不是厂商。名单在 `backend/internal/support/models.go`，当前只有奔图
+MS6000NW。扫描结果仍会列出其他设备（方便确认「这台机器在线」），但标成「暂不支持」
+且不能添加；创建打印机、创建端点、CUPS 直连和下单四条路径都按同一张名单校验，
+避免从旧接口绕过。新增一台机器需要先在真机上把驱动链路跑通，再加一条：
+
+```go
+{
+    ID: "pantum-ms6000nw", Name: "奔图 MS6000NW", Vendor: "Pantum",
+    Tokens: []string{"ms6000nw"}, Driver: "ms6000nw",
+    Notes: "", // 可选：只写机型本身的限制，不写某台机器的故障
+},
+```
+
+`Tokens` 与设备上报的型号（去标点、转小写）匹配，`Driver` 指定实测可用的 PPD
+片段，优先于模糊匹配，防止装到同系列另一款机型的驱动。
+
 在容器里跑厂商 filter 需要两件事，缺一不可：
 
 - filter 必须可执行（官方 deb 里部分 filter 没有 exec 位）

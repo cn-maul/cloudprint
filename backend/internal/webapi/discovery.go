@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"cloudprint/internal/ipp"
 	"cloudprint/internal/printer/discovery"
 	"cloudprint/internal/store"
+	"cloudprint/internal/support"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -32,6 +34,7 @@ func (s *Server) handleCandidates(w http.ResponseWriter, r *http.Request) {
 	// Match by IP / MAC / serial against the printers that actually exist.
 	printers, _ := s.Store.ListPrinters(r.Context(), true)
 	byHost := map[string]string{}
+	byHostID := map[string]string{}
 	byMAC := map[string]string{}
 	bySerial := map[string]string{}
 	names := map[string]string{}
@@ -39,10 +42,12 @@ func (s *Server) handleCandidates(w http.ResponseWriter, r *http.Request) {
 		names[p.ID] = p.DisplayName
 		if p.NetworkAddress != "" {
 			byHost[strings.ToLower(strings.TrimSpace(p.NetworkAddress))] = p.DisplayName
+			byHostID[strings.ToLower(strings.TrimSpace(p.NetworkAddress))] = p.ID
 		}
 		for _, ep := range p.Endpoints {
 			if host := uriHost(ep.URI); host != "" {
 				byHost[host] = p.DisplayName
+				byHostID[host] = p.ID
 			}
 			if ep.MAC != "" {
 				byMAC[strings.ToLower(strings.TrimSpace(ep.MAC))] = p.DisplayName
@@ -54,6 +59,15 @@ func (s *Server) handleCandidates(w http.ResponseWriter, r *http.Request) {
 	}
 	for i := range list {
 		c := &list[i]
+		// The model whitelist decides what may be added; the UI shows the
+		// reason instead of an add button.
+		if m, ok := support.Match(c.Model); ok {
+			c.Supported = true
+			c.Model = m.Name
+		} else {
+			c.Supported = false
+			c.UnsupportedReason = support.RejectMessage(c.Model)
+		}
 		if c.MergedPrinterID != "" {
 			c.AlreadyAdded = true
 			c.PrinterName = names[c.MergedPrinterID]
@@ -61,6 +75,7 @@ func (s *Server) handleCandidates(w http.ResponseWriter, r *http.Request) {
 		if name, ok := byHost[strings.ToLower(strings.TrimSpace(c.Host))]; ok {
 			c.AlreadyAdded = true
 			c.PrinterName = firstNonEmpty(c.PrinterName, name)
+			c.MergedPrinterID = firstNonEmpty(c.MergedPrinterID, byHostID[strings.ToLower(strings.TrimSpace(c.Host))])
 		}
 		if name, ok := byMAC[strings.ToLower(strings.TrimSpace(c.MAC))]; ok && c.MAC != "" {
 			c.AlreadyAdded = true
@@ -71,7 +86,18 @@ func (s *Server) handleCandidates(w http.ResponseWriter, r *http.Request) {
 			c.PrinterName = firstNonEmpty(c.PrinterName, name)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"candidates": list})
+	// A scan list is a list of things left to add. Devices that are already
+	// registered only create noise (and a second "add" that fails on a
+	// duplicate endpoint), so they are dropped here rather than hidden in the
+	// browser.
+	out := make([]store.Candidate, 0, len(list))
+	for _, c := range list {
+		if c.AlreadyAdded {
+			continue
+		}
+		out = append(out, c)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"candidates": out})
 }
 
 func uriHost(raw string) string {
@@ -80,6 +106,14 @@ func uriHost(raw string) string {
 		return ""
 	}
 	return strings.ToLower(u.Hostname())
+}
+
+// handleSupportedModels lists the printer models this build may drive. The
+// add form uses it for the model picker: a device that cannot report its model
+// (RAW 9100) has to be told apart by the admin, and only tested models may be
+// chosen.
+func (s *Server) handleSupportedModels(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"models": support.Models()})
 }
 
 // candidateHost extracts the printer's LAN address from the address the admin
@@ -141,10 +175,36 @@ func parseCandidateURI(raw, kind string) (discovery.Found, error) {
 		kind = "ipp"
 	}
 	if kind == "socket" {
-		return discovery.Found{}, errString("RAW 9100 无法解释 PDF，请改用 CUPS 队列接入")
+		// RAW is accepted now: the server renders the page and writes the
+		// device's own language to port 9100. There is no job protocol, so
+		// such a printer cannot report progress or be cancelled.
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "socket" && u.Scheme != "lpd") {
+			return discovery.Found{}, errString("RAW 地址必须以 socket:// 开头")
+		}
+		host := u.Hostname()
+		if host == "" {
+			return discovery.Found{}, errString("地址缺少主机名或 IP")
+		}
+		port := u.Port()
+		if port == "" {
+			if u.Scheme == "lpd" {
+				port = "515"
+			} else {
+				port = "9100"
+			}
+		}
+		pn, err := strconv.Atoi(port)
+		if err != nil || pn < 1 || pn > 65535 {
+			return discovery.Found{}, errString("端口无效")
+		}
+		return discovery.Found{
+			URI: u.Scheme + "://" + net.JoinHostPort(host, port), Kind: "socket",
+			Host: host, Port: pn, Path: "",
+		}, nil
 	}
 	if kind != "ipp" {
-		return discovery.Found{}, errString("端点类型必须是 ipp")
+		return discovery.Found{}, errString("端点类型必须是 ipp 或 socket")
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -197,6 +257,12 @@ func (s *Server) handleApproveCandidate(w http.ResponseWriter, r *http.Request) 
 	}
 	if c.Status != "new" {
 		writeErr(w, http.StatusConflict, "CANDIDATE_CLOSED", "该候选已处理")
+		return
+	}
+	// Approving a discovery record is another way to create a printable
+	// device, so the model whitelist applies here too.
+	if c.Model != "" && !support.Supported(c.Model) {
+		writeErr(w, http.StatusConflict, "MODEL_UNSUPPORTED", support.RejectMessage(c.Model))
 		return
 	}
 	var printerID string
@@ -579,6 +645,9 @@ func (s *Server) handleQuickAddPrinter(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &in) {
 		return
 	}
+	// Build the printer record first. The whitelist check happens after the
+	// device has been probed, because a discovery record's model name can be
+	// stale; what the hardware reports is authoritative.
 	name := strings.TrimSpace(in.DisplayName)
 	if name == "" {
 		writeErr(w, http.StatusBadRequest, "NAME_REQUIRED", "请填写打印机名称，方便同事辨认")
@@ -592,10 +661,20 @@ func (s *Server) handleQuickAddPrinter(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "URI_REQUIRED", "请填写打印机 IP 地址")
 		return
 	}
-	if !strings.Contains(rawURI, "://") {
+	// A bare address is an IPP printer unless the admin asked for RAW 9100 via
+	// driver_mode=socket. RAW is the fallback for old devices that have no IPP
+	// server at all.
+	rawMode := strings.EqualFold(strings.TrimSpace(in.DriverMode), "socket")
+	if !strings.Contains(rawURI, "://") && rawMode {
+		rawURI = "socket://" + strings.TrimSuffix(rawURI, "/") + ":9100"
+	} else if !strings.Contains(rawURI, "://") {
 		rawURI = "ipp://" + strings.TrimSuffix(rawURI, "/") + "/ipp/print"
 	}
-	f, err := parseCandidateURI(rawURI, "ipp")
+	kind := "ipp"
+	if strings.HasPrefix(rawURI, "socket://") || strings.HasPrefix(rawURI, "lpd://") {
+		kind = "socket"
+	}
+	f, err := parseCandidateURI(rawURI, kind)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "URI_INVALID", err.Error())
 		return
@@ -649,7 +728,10 @@ func (s *Server) handleQuickAddPrinter(w http.ResponseWriter, r *http.Request) {
 		}); err == nil {
 			if mm := strings.TrimSpace(msg.String(ipp.TagPrinterAttributes, "printer-make-and-model")); mm != "" {
 				if clean, ok := cleanModelName(mm); ok {
-					model = firstNonEmpty(model, clean)
+					// What the device reports outranks the form field: the
+					// admin may have typed a label, but the whitelist has to
+					// judge the hardware that will actually receive jobs.
+					model = clean
 				}
 			}
 			for _, format := range msg.Strings(ipp.TagPrinterAttributes, "document-format-supported") {
@@ -666,6 +748,20 @@ func (s *Server) handleQuickAddPrinter(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	_ = s.Store.UpdatePrinter(r.Context(), p.ID, nil, nil, &vendor, &model, nil, nil)
+
+	// A model that has not been tested end to end must not become printable:
+	// jobs would fail after upload with nothing on paper, which is worse than
+	// a clear "not supported yet" at add time.
+	listed, ok := support.Match(model)
+	if !ok {
+		cleanup()
+		writeErr(w, http.StatusConflict, "MODEL_UNSUPPORTED", support.RejectMessage(model))
+		return
+	}
+	model = listed.Name
+	// Persist the canonical name: the whitelist is matched on it, and one
+	// spelling in the database keeps later edits and job checks consistent.
+	_ = s.Store.UpdatePrinter(r.Context(), p.ID, nil, nil, nil, &model, nil, nil)
 
 	if directPDF && strings.TrimSpace(in.PPD) == "" {
 		_ = s.Store.DisablePrinterEndpoints(r.Context(), p.ID)
@@ -701,7 +797,7 @@ func (s *Server) handleQuickAddPrinter(w http.ResponseWriter, r *http.Request) {
 	ppdPath := strings.TrimSpace(in.PPD)
 	driverName := ""
 	if ppdPath != "" {
-		driverName = ppdPath
+		driverName = ppdDisplayName(s.CUPS, ppdPath)
 	}
 	// A vendor PPD wins over driverless even when the device advertises
 	// PWG-Raster or URF. Those formats are only a claim: several network
@@ -709,12 +805,29 @@ func (s *Server) handleQuickAddPrinter(w http.ResponseWriter, r *http.Request) {
 	// own dialect, and the DRIVERLESS queue then swallows every job. A matched
 	// PPD names the one filter that actually works with this hardware.
 	if ppdPath == "" {
+		// The whitelist entry names the driver this model was tested with, so
+		// it beats the fuzzy match (which can pick a sibling model's PPD).
+		if best := s.CUPS.PreferredPPD(listed.DriverHint()); best != nil {
+			ppdPath = best.Path
+			driverName = best.Name
+		}
+	}
+	if ppdPath == "" {
 		if best := s.CUPS.MatchPPD(model); best != nil {
 			ppdPath = best.Path
 			driverName = best.Name
 		}
 	}
+	// RAW 9100 has no capability query at all, so the device cannot advertise
+	// driverless support. A queue with an explicit PPD is the only sane
+	// default; otherwise let the admin pick one.
 	useDriverless := ppdPath == "" && driverless && !strings.EqualFold(in.DriverMode, "ppd")
+	if ppdPath == "" && kind == "socket" {
+		cleanup()
+		writeErr(w, http.StatusConflict, "DRIVER_REQUIRED",
+			"这台打印机只开了 RAW 9100，无法自动识别型号。请在上一步选择一个驱动后重试。")
+		return
+	}
 	if ppdPath == "" {
 		if !useDriverless {
 			cleanup()
@@ -803,4 +916,23 @@ func cleanModelName(raw string) (string, bool) {
 		return "", false
 	}
 	return s, true
+}
+
+// ppdDisplayName turns whatever the UI sent into a human label. A model name
+// from CUPS ("openprinting-ppds:0/ppd/...") is meaningless on screen, and a
+// file path is only slightly better.
+func ppdDisplayName(c *cups.Client, ppd string) string {
+	ppd = strings.TrimSpace(ppd)
+	if ppd == "" {
+		return ""
+	}
+	if c != nil {
+		for _, d := range c.PPDs() {
+			if d.Path == ppd {
+				return d.Name
+			}
+		}
+	}
+	base := filepath.Base(ppd)
+	return strings.TrimSuffix(base, filepath.Ext(base))
 }

@@ -125,10 +125,13 @@ func (s *Server) handlePrinterOptions(w http.ResponseWriter, r *http.Request) {
 		caps.Media = []string{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"printer_id":  p.ID,
-		"model":       model,
-		"reachable":   reachable,
-		"paper_sizes": availablePapers(caps.Media),
+		"printer_id": p.ID,
+		"model":      model,
+		"reachable":  reachable,
+		// This build prints A4 only; the tray/handling on the supported model
+		// is not tested for Letter or Legal, and a wrong size either jams or
+		// silently scales the page.
+		"paper_sizes": []string{"A4"},
 		"copies_max":  copiesMax(caps.MaxCopies),
 		"can_duplex":  supportsSides(caps.Sides),
 		"can_color":   supportsColor(caps.ColorModes),
@@ -140,40 +143,6 @@ func (s *Server) handlePrinterOptions(w http.ResponseWriter, r *http.Request) {
 		// able to tell whether the buttons would do anything.
 		"operations": supportedOps,
 	})
-}
-
-// availablePapers maps the device's IPP media keywords onto the four names the
-// renderer knows. Unknown sizes are dropped rather than passed through: a paper
-// name the renderer cannot map fails the whole job.
-func availablePapers(media []string) []string {
-	if len(media) == 0 {
-		return []string{"A4"}
-	}
-	seen := map[string]bool{}
-	out := []string{}
-	add := func(name string) {
-		if !seen[name] {
-			seen[name] = true
-			out = append(out, name)
-		}
-	}
-	for _, m := range media {
-		lower := strings.ToLower(strings.TrimSpace(m))
-		switch {
-		case strings.HasPrefix(lower, "iso_a4"), lower == "a4":
-			add("A4")
-		case strings.HasPrefix(lower, "iso_a3"), lower == "a3":
-			add("A3")
-		case strings.HasPrefix(lower, "na_letter"), lower == "letter":
-			add("Letter")
-		case strings.HasPrefix(lower, "na_legal"), lower == "legal":
-			add("Legal")
-		}
-	}
-	if len(out) == 0 {
-		return []string{"A4"}
-	}
-	return out
 }
 
 func copiesMax(n int) int {
