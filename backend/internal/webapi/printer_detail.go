@@ -50,10 +50,15 @@ func (s *Server) handlePrinterDetail(w http.ResponseWriter, r *http.Request) {
 	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 && v <= 100 {
 		limit = v
 	}
-	jobs, total, err := s.Store.ListJobs(r.Context(), store.JobFilter{
-		PrinterID: p.ID,
-		Limit:     limit,
-	})
+	offset := 0
+	if v, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && v > 0 {
+		offset = v
+	}
+	filter := store.JobFilter{PrinterID: p.ID, Limit: limit, Offset: offset}
+	if st := strings.TrimSpace(r.URL.Query().Get("status")); st != "" {
+		filter.Statuses = strings.Split(st, ",")
+	}
+	jobs, total, err := s.Store.ListJobs(r.Context(), filter)
 	if err != nil {
 		s.jsonError(w, err)
 		return
@@ -63,6 +68,8 @@ func (s *Server) handlePrinterDetail(w http.ResponseWriter, r *http.Request) {
 		"status":  status,
 		"jobs":    jobs,
 		"total":   total,
+		"limit":   filter.Limit,
+		"offset":  filter.Offset,
 	})
 }
 

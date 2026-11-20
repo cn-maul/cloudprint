@@ -170,6 +170,60 @@ func (c *Client) GetJobAttributes(ctx context.Context, jobURI string) (*Message,
 	return c.roundTrip(ctx, OpGetJobAttributes, []Group{g}, nil)
 }
 
+// CancelJob asks the device itself to stop a job. CloudPrint submits documents
+// straight to the printer, so cupsd has never seen this job-id and its
+// `cancel` command cannot match it.
+//
+// Cancel-Job names the job as printer-uri + job-id, not job-uri: the Pantum
+// rejects a request carrying only job-uri with client-error-bad-request.
+func (c *Client) CancelJob(ctx context.Context, jobID int32, userName string) error {
+	if jobID <= 0 {
+		return fmt.Errorf("缺少 job-id")
+	}
+	if strings.TrimSpace(userName) == "" {
+		userName = "cloudprint"
+	}
+	g := c.operationGroup(
+		attr("printer-uri", ValueURI, text(ValueURI, c.PrinterURI)),
+		attr("job-id", ValueInteger, integer(jobID)),
+		attr("requesting-user-name", ValueNameWithoutLang, text(ValueNameWithoutLang, userName)),
+	)
+	_, err := c.roundTrip(ctx, OpCancelJob, []Group{g}, nil)
+	return err
+}
+
+// JobIDFromURI extracts the numeric job-id from a job URI. Two shapes occur in
+// the field: the standard "ipp://host/jobs/42" and the Pantum's
+// "ipp://host/ipp/print/job-id:0000006f", whose number is hexadecimal.
+// Devices that reject job-uri on Cancel-Job still need the number.
+func JobIDFromURI(jobURI string) (int32, bool) {
+	u, err := url.Parse(strings.TrimSpace(jobURI))
+	if err != nil {
+		return 0, false
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i := len(parts) - 1; i >= 0; i-- {
+		part := parts[i]
+		if part == "" {
+			continue
+		}
+		// job-id:0000006f carries the id as lowercase hex, not decimal.
+		if v, ok := strings.CutPrefix(strings.ToLower(part), "job-id:"); ok {
+			n, err := strconv.ParseInt(v, 16, 32)
+			if err != nil || n <= 0 {
+				return 0, false
+			}
+			return int32(n), true
+		}
+		n, err := strconv.ParseInt(part, 10, 32)
+		if err != nil || n <= 0 {
+			return 0, false
+		}
+		return int32(n), true
+	}
+	return 0, false
+}
+
 // GetJobs lists jobs the device still knows about. "completed" includes
 // aborted jobs on most devices, so the caller must also check job-state and
 // job-impressions-completed before claiming paper came out.

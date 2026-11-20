@@ -579,6 +579,49 @@ func (s *Store) RecordEndpointEvent(ctx context.Context, endpointID, event strin
 		VALUES (?, ?, ?, ?)`, endpointID, event, string(b), Now())
 }
 
+// ListEndpointEvents returns a printer's driver and device history, newest
+// first. Events are keyed by endpoint, so a printer with a replaced queue
+// still shows the old connection's history — that is usually the point.
+//
+// detail_json is decoded back into a map so callers get structured data
+// instead of an escaped string; a malformed row is returned without detail
+// rather than failing the whole list.
+func (s *Store) ListEndpointEvents(ctx context.Context, printerID string, limit int, eventFilter string) ([]EndpointEvent, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	q := `SELECT ev.id, ev.endpoint_id, ev.event, ev.detail_json, ev.created_at
+		FROM printer_endpoint_events ev
+		JOIN printer_endpoints ep ON ep.id = ev.endpoint_id
+		WHERE ep.printer_id = ?`
+	args := []any{printerID}
+	if eventFilter != "" {
+		q += ` AND ev.event = ?`
+		args = append(args, eventFilter)
+	}
+	q += ` ORDER BY ev.id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.DB.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []EndpointEvent{}
+	for rows.Next() {
+		var ev EndpointEvent
+		var detail string
+		if err := rows.Scan(&ev.ID, &ev.EndpointID, &ev.Event, &detail, &ev.CreatedAt); err != nil {
+			return nil, err
+		}
+		var parsed any
+		if json.Unmarshal([]byte(detail), &parsed) == nil {
+			ev.Detail = parsed
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListCandidates(ctx context.Context, status string) ([]Candidate, error) {
 	q := `SELECT id, source, discovered_uri, kind, host, port, path, dedupe_key, mac,
 		vendor, model, serial_number, raw_json, status, possible_ip_change,

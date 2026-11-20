@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"cloudprint/internal/files"
+	"cloudprint/internal/ipp"
 	"cloudprint/internal/printer"
 	"cloudprint/internal/store"
 
@@ -68,6 +69,9 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 	in.FileID = fileForJob.ID
 	in.PDFFileID = fileForJob.ID
+	// The job history must point at what the user uploaded, not at the
+	// throwaway PDF carved out for a page range.
+	in.OriginalFileID = file.ID
 	in.Pages = pages
 	if in.PageRange != "" && pages == file.PageCount {
 		// "1-全部页" still prints the whole document; keep the label but do
@@ -277,15 +281,17 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "FORBIDDEN", "无权取消该任务")
 		return
 	}
-	if job.Status == "printing" && job.CUPSJobID != "" && s.CUPS != nil {
-		// The job is already in cupsd. Cancel it there first; otherwise the
-		// database says "canceled" while the printer keeps printing.
+	if job.Status == "printing" && job.CUPSJobID != "" {
+		// The document went straight to the device, so the job-id only exists
+		// on the printer. Asking cupsd to cancel it would always fail with
+		// "no such job"; send Cancel-Job to the device instead so the database
+		// and the paper stay in step.
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-		err := s.CUPS.CancelJob(ctx, job.CUPSJobID)
+		err := s.cancelDeviceJob(ctx, job)
 		cancel()
 		if err != nil {
-			writeErr(w, http.StatusBadGateway, "CUPS_CANCEL_FAILED",
-				"无法取消打印队列里的任务："+err.Error())
+			writeErr(w, http.StatusBadGateway, "DEVICE_CANCEL_FAILED",
+				"无法取消打印机上的任务："+err.Error())
 			return
 		}
 		if err := s.Store.CancelSubmittedJob(r.Context(), id, "CANCELED", "用户取消了打印"); err != nil {
@@ -298,6 +304,14 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, updated)
 		return
 	}
+	if job.Status == "printing" && job.CUPSJobID == "" {
+		// The document is in the device's hands but it has not answered with a
+		// job reference yet, so there is nothing to name in Cancel-Job. Saying
+		// "not in a cancelable state" would be wrong; the job is printing.
+		writeErr(w, http.StatusConflict, "CANCEL_NOT_READY",
+			"打印机还在接收这份文件，暂时无法取消。请等几秒再试，或直接在打印机上停止。")
+		return
+	}
 	if err := s.Store.CancelJob(r.Context(), id, u.ID, u.Role == "admin"); err != nil {
 		writeErr(w, http.StatusConflict, "CANCEL_REJECTED", err.Error())
 		return
@@ -306,6 +320,125 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	updated, _ := s.Store.GetJob(r.Context(), id)
 	s.Hub.Publish(job.UserID, "job.canceled", updated)
 	writeJSON(w, http.StatusOK, updated)
+}
+
+// cancelDeviceJob reaches the printer that actually holds the document. A
+// CUPS-backed printer is resolved through its queue; a direct IPP endpoint has
+// its address in the job snapshot.
+func (s *Server) cancelDeviceJob(ctx context.Context, job *store.Job) error {
+	jobID, ok := ipp.JobIDFromURI(job.CUPSJobID)
+	if !ok {
+		return fmt.Errorf("无法从任务地址 %q 解析任务编号", job.CUPSJobID)
+	}
+	if job.QueueName != "" && s.CUPS != nil {
+		return s.CUPS.CancelDeviceJob(ctx, job.QueueName, jobID, job.Username)
+	}
+	uri := strings.TrimSpace(job.EndpointURI)
+	if !strings.HasPrefix(uri, "ipp://") && !strings.HasPrefix(uri, "ipps://") {
+		return fmt.Errorf("任务没有记录可用的打印机地址")
+	}
+	client, err := ipp.NewClient(uri, 15*time.Second)
+	if err != nil {
+		return err
+	}
+	return client.CancelJob(ctx, jobID, job.Username)
+}
+
+// handleRetryJob requeues a failed or canceled job without making the user
+// upload the same document again. The new row keeps retry_of so the queue can
+// show that it is a second attempt at the same file.
+//
+// The already-extracted PDF is reused verbatim: page ranges were applied when
+// the original job was created, so re-applying the range here would print the
+// wrong pages of the subset.
+func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
+	u := currentUser(r)
+	src, err := s.Store.GetJob(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "JOB_NOT_FOUND", "任务不存在")
+		return
+	}
+	// Only the owner may retry: the new job must land in the same personal
+	// queue and spend the same daily quota as the failed attempt.
+	if src.UserID != u.ID {
+		writeErr(w, http.StatusForbidden, "FORBIDDEN", "无权重试该任务")
+		return
+	}
+	if src.Status != "failed" && src.Status != "canceled" {
+		writeErr(w, http.StatusConflict, "RETRY_NOT_ALLOWED",
+			"只有失败或已取消的任务可以重试；正在打印的任务请先取消")
+		return
+	}
+	if src.PrinterID == "" {
+		writeErr(w, http.StatusConflict, "PRINTER_GONE", "这台打印机已被删除，请重新选择打印机")
+		return
+	}
+	p, err := s.Store.GetPrinter(r.Context(), src.PrinterID)
+	if err != nil {
+		writeErr(w, http.StatusConflict, "PRINTER_GONE", "这台打印机已被删除，请重新选择打印机")
+		return
+	}
+	if !p.IsEnabled {
+		writeErr(w, http.StatusConflict, "PRINTER_DISABLED", "这台打印机已停用")
+		return
+	}
+	allowed, err := s.Store.UserCanUsePrinter(r.Context(), u.ID, u.Role, p.ID)
+	if err != nil {
+		s.jsonError(w, err)
+		return
+	}
+	if !allowed {
+		writeErr(w, http.StatusForbidden, "PRINTER_FORBIDDEN", "你所在的用户组没有这台打印机的使用权限")
+		return
+	}
+	file, err := s.Store.GetFile(r.Context(), src.PDFFile)
+	if err != nil || file.StoragePath == "" {
+		writeErr(w, http.StatusGone, "FILE_EXPIRED",
+			"原始文件已超过保留期被清理，请重新上传后再打印")
+		return
+	}
+	pages := src.PageCount
+	if pages <= 0 {
+		pages = file.PageCount
+	}
+	used, err := s.Store.PagesToday(r.Context(), u.ID)
+	if err != nil {
+		s.jsonError(w, err)
+		return
+	}
+	required := pages * src.Copies
+	if u.DailyPageQuota > 0 && used+required > u.DailyPageQuota {
+		writeErr(w, http.StatusTooManyRequests, "QUOTA_EXCEEDED",
+			fmt.Sprintf("今日剩余 %d 页，本次需要 %d 页。", maxInt(u.DailyPageQuota-used, 0), required))
+		return
+	}
+	if printer.SelectEndpoint(p, src.Duplex) == nil {
+		writeErr(w, http.StatusConflict, "PRINTER_OFFLINE", "这台打印机现在连不上，请稍后再试")
+		return
+	}
+	job, err := s.Store.CreateJob(r.Context(), store.NewJob{
+		UserID:         u.ID,
+		PrinterID:      p.ID,
+		FileID:         src.PDFFile,
+		Copies:         src.Copies,
+		Duplex:         src.Duplex,
+		ColorMode:      src.ColorMode,
+		PaperSize:      src.PaperSize,
+		PageRange:      src.PageRange,
+		Pages:          pages,
+		RetryOf:        src.ID,
+		OriginalFileID: src.OriginalFile,
+	})
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "JOB_REJECTED", err.Error())
+		return
+	}
+	s.Store.Audit(r.Context(), u.ID, "retry", "job", job.ID,
+		map[string]any{"retry_of": src.ID, "printer_id": job.PrinterID})
+	s.Log.Info("job retried", "job", job.ID, "retry_of", src.ID, "user", u.Username)
+	s.Hub.Publish(job.UserID, "job.created", job)
+	go s.tryDispatch(job.ID, u.ID)
+	writeJSON(w, http.StatusCreated, job)
 }
 
 func maxInt(a, b int) int {

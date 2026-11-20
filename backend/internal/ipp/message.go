@@ -14,6 +14,7 @@ const (
 	OpGetPrinterAttributes = 0x000B
 	OpGetJobs              = 0x000A
 	OpGetJobAttributes     = 0x0009
+	OpCancelJob            = 0x0008
 	OpPrintJob             = 0x0002
 	OpValidateJob          = 0x0004
 )

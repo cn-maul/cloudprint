@@ -767,6 +767,21 @@ func (c *Client) CancelJob(ctx context.Context, job string) error {
 	return err
 }
 
+// CancelDeviceJob cancels a job that was submitted straight to the printer.
+// The queue is only used to find the device URI; the Cancel-Job operation goes
+// to the printer, because cupsd never accepted this document.
+func (c *Client) CancelDeviceJob(ctx context.Context, queue string, jobID int32, userName string) error {
+	deviceURI, err := c.DeviceURI(ctx, queue)
+	if err != nil {
+		return err
+	}
+	client, err := ipp.NewClient(deviceURI, 15*time.Second)
+	if err != nil {
+		return err
+	}
+	return client.CancelJob(ctx, jobID, userName)
+}
+
 type PPD struct {
 	Path         string `json:"path"`
 	Name         string `json:"name"`

@@ -23,6 +23,9 @@ type NewJob struct {
 	RetryOf   string `json:"-"`
 	PDFFileID string `json:"-"`
 	Pages     int    `json:"-"`
+	// OriginalFileID keeps a retry pointing at the upload the user chose, not
+	// at the temporary page-range PDF derived from it.
+	OriginalFileID string `json:"-"`
 }
 
 func (s *Store) PagesToday(ctx context.Context, userID string) (int, error) {
@@ -95,12 +98,16 @@ func (s *Store) CreateJob(ctx context.Context, in NewJob) (*Job, error) {
 		return nil, fmt.Errorf("无效的颜色参数")
 	}
 	now := Now()
+	originalFile := in.OriginalFileID
+	if originalFile == "" {
+		originalFile = file.ID
+	}
 	j := &Job{
 		ID:           "j_" + uuid.NewString(),
 		UserID:       in.UserID,
 		PrinterID:    printer.ID,
 		PrinterName:  printer.DisplayName,
-		OriginalFile: file.ID,
+		OriginalFile: originalFile,
 		PDFFile:      in.PDFFileID,
 		FileName:     file.OriginalName,
 		Status:       "queued",

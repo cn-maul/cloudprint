@@ -108,7 +108,11 @@ func (s *Server) Routes() http.Handler {
 			r.Get("/jobs/events", s.handleEvents)
 			r.Get("/jobs/{id}", s.handleGetJob)
 			r.Post("/jobs/{id}/cancel", s.handleCancelJob)
+			r.Post("/jobs/{id}/retry", s.handleRetryJob)
 			r.Post("/printers/{id}/jobs/clear", s.handleClearJobs)
+			r.Get("/printers/{id}/events", s.handlePrinterEvents)
+			r.Get("/printers/{id}/diagnostics", s.handlePrinterDiagnostics)
+			r.Get("/printers/{id}/options", s.handlePrinterOptions)
 			r.Group(func(r chi.Router) {
 				r.Use(s.adminOnly)
 				r.Get("/admin/dashboard", s.adminDashboard)

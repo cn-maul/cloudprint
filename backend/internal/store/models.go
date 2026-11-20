@@ -215,6 +215,17 @@ type DiscoveryRun struct {
 	ErrorMessage string `json:"error_message,omitempty"`
 }
 
+// EndpointEvent is one driver/probe record for a printer connection. The
+// queue shows jobs, but "the driver worked yesterday and fails today" is only
+// visible here, so it is exposed as its own read-only history.
+type EndpointEvent struct {
+	ID         int64  `json:"id"`
+	EndpointID string `json:"endpoint_id"`
+	Event      string `json:"event"`
+	Detail     any    `json:"detail,omitempty"`
+	CreatedAt  string `json:"created_at"`
+}
+
 type DirectoryUser struct {
 	ID          string `json:"id"`
 	Username    string `json:"username"`
