@@ -40,9 +40,8 @@ export type Capabilities = {
 export type Endpoint = {
   id: string;
   printer_id: string;
-  kind: "ipp" | "socket" | "agent";
+  kind: "ipp" | "cups";
   uri: string;
-  agent_id?: string;
   queue_name?: string;
   protocol?: string;
   priority: number;
@@ -53,7 +52,8 @@ export type Endpoint = {
   last_error?: string;
   capabilities: Capabilities;
   capabilities_source: string;
-  agent_name?: string;
+  ppd_name?: string;
+  direct_pdf?: boolean;
 };
 
 export type Printer = {
@@ -80,7 +80,8 @@ export type Job = {
   printer_name?: string;
   endpoint_id?: string;
   endpoint_uri?: string;
-  agent_id?: string;
+  queue_name?: string;
+  cups_job_id?: string;
   pdf_file_id?: string;
   file_name?: string;
   status: string;
@@ -88,6 +89,7 @@ export type Job = {
   duplex: string;
   color_mode: string;
   paper_size: string;
+  page_range?: string;
   page_count: number;
   total_pages: number;
   error_code?: string;
@@ -111,7 +113,6 @@ export type Candidate = {
   model?: string;
   serial_number?: string;
   direct: boolean;
-  needs_agent: boolean;
   probe_attempted?: boolean;
   status: string;
   possible_ip_change: boolean;
@@ -124,30 +125,33 @@ export type Candidate = {
 export type QuickAddResult = {
   printer: Printer;
   direct: boolean;
-  mode: "direct" | "agent";
+  mode: "ipp" | "cups";
   message: string;
-  agent?: {
-    id: string;
-    name: string;
-    token: string;
-    endpoint_id: string;
-    download_url: string;
-    setup_script: string;
-  };
+  queue?: string;
+  driver?: string;
 };
 
-export type Agent = {
-  id: string;
+export type CUPSQueue = {
   name: string;
-  version: string;
-  print_command: string;
-  last_seen_at?: string;
-  online: boolean;
-  is_active: boolean;
-  queues: unknown;
-  status: unknown;
-  endpoint_ids?: string[];
-  printer_ids?: string[];
+  state: string;
+  enabled: boolean;
+  accepting: boolean;
+  device_uri?: string;
+  make_model?: string;
+  jobs: number;
+  linked_printer_id?: string;
+};
+
+export type CUPSDriver = {
+  path: string;
+  name: string;
+  manufacturer?: string;
+  model?: string;
+};
+
+export type CUPSStatus = {
+  available: boolean;
+  reason?: string;
 };
 
 export type DiscoveryRun = {
@@ -161,6 +165,36 @@ export type DiscoveryRun = {
   error_message?: string;
 };
 
+export type ScanTarget = {
+  cidr: string;
+  label: string;
+};
+
+export type ScanTargets = {
+  targets: ScanTarget[];
+  client_ip?: string;
+  can_scan: boolean;
+  configured_cidrs?: string[];
+};
+
+export type PrinterStatus = {
+  state: "idle" | "processing" | "stopped" | "unknown" | string;
+  reasons?: string[];
+  message?: string;
+  queue?: string;
+  queue_state?: string;
+  direct_pdf: boolean;
+  active_jobs: number;
+  model?: string;
+};
+
+export type PrinterDetail = {
+  printer: Printer;
+  status: PrinterStatus;
+  jobs: Job[];
+  total: number;
+};
+
 export type DashboardData = {
   status_counts?: Record<string, number>;
   printers_enabled: number;
@@ -170,8 +204,8 @@ export type DashboardData = {
   failed_jobs_today: number;
   completed_today: number;
   new_candidates: number;
-  agents_online: number;
-  agents_total: number;
+  cups_ready: number;
+  cups_total: number;
   daily_pages: number;
   daily_page_quota: number;
   max_upload_mb: number;
@@ -254,6 +288,13 @@ export const jobStatus: Record<string, {label: string; tone: string}> = {
   rejected: {label: "已拒绝", tone: "text-danger"},
 };
 
+export const printerStateLabel: Record<string, string> = {
+  idle: "就绪",
+  processing: "打印中",
+  stopped: "已停止",
+  unknown: "未知",
+};
+
 export const healthLabel: Record<string, {label: string; color: "success" | "warning" | "danger" | "default"}> = {
   healthy: {label: "正常", color: "success"},
   degraded: {label: "部分可用", color: "warning"},
@@ -268,7 +309,6 @@ export const duplexLabel: Record<string, string> = {
 };
 
 export const endpointKindLabel: Record<string, string> = {
-  ipp: "网络直连",
-  socket: "网络直连（旧）",
-  agent: "由 Windows 电脑转发",
+  ipp: "打印机直连",
+  cups: "服务器 CUPS 队列",
 };

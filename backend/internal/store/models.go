@@ -34,6 +34,19 @@ type Capabilities struct {
 	State           string   `json:"state,omitempty"`
 	StateReasons    []string `json:"state_reasons,omitempty"`
 	CheckedAt       string   `json:"checked_at,omitempty"`
+	// Resolution is the device's native raster DPI as reported by
+	// printer-resolution-default. Rendering at the same resolution keeps the
+	// printer from resampling (and from rejecting a mismatched raster).
+	Resolution int `json:"resolution,omitempty"`
+}
+
+// ResolutionDPI returns the DPI to render at, defaulting to 600 because every
+// driverless monochrome laser seen so far advertises that.
+func (c Capabilities) ResolutionDPI() int {
+	if c.Resolution >= 150 && c.Resolution <= 1200 {
+		return c.Resolution
+	}
+	return 600
 }
 
 func (c Capabilities) SupportsPDF() bool {
@@ -54,8 +67,6 @@ type Endpoint struct {
 	Kind             string       `json:"kind"`
 	URI              string       `json:"uri"`
 	DedupeKey        string       `json:"dedupe_key"`
-	AgentID          string       `json:"agent_id,omitempty"`
-	QueueName        string       `json:"queue_name,omitempty"`
 	Protocol         string       `json:"protocol,omitempty"`
 	MAC              string       `json:"mac,omitempty"`
 	SerialNumber     string       `json:"serial_number,omitempty"`
@@ -67,26 +78,34 @@ type Endpoint struct {
 	LastError        string       `json:"last_error,omitempty"`
 	Capabilities     Capabilities `json:"capabilities"`
 	CapabilitySource string       `json:"capabilities_source"`
-	AgentName        string       `json:"agent_name,omitempty"`
+	// QueueName is the CUPS queue behind a "cups" endpoint. For "ipp"
+	// endpoints it is empty and URI is the device URL.
+	QueueName string `json:"queue_name,omitempty"`
+	// PPDName is the driver CUPS uses for a queue, shown so an admin can see
+	// whether the vendor driver was picked instead of a generic fallback.
+	PPDName string `json:"ppd_name,omitempty"`
+	// DirectPDF is true when the device itself accepts application/pdf.
+	DirectPDF bool   `json:"direct_pdf,omitempty"`
+	Jammed    string `json:"jammed,omitempty"`
 }
 
 type Printer struct {
-	ID           string     `json:"id"`
-	DisplayName  string     `json:"display_name"`
-	Location     string     `json:"location"`
-	Vendor       string     `json:"vendor"`
-	Model        string     `json:"model"`
-	SerialNumber string     `json:"serial_number"`
-	ProfileID    string     `json:"profile_id"`
+	ID           string `json:"id"`
+	DisplayName  string `json:"display_name"`
+	Location     string `json:"location"`
+	Vendor       string `json:"vendor"`
+	Model        string `json:"model"`
+	SerialNumber string `json:"serial_number"`
+	ProfileID    string `json:"profile_id"`
 	// NetworkAddress is the printer's LAN IP, kept even when the job is sent
 	// through a Windows helper. It is how discovery knows the device is
 	// already registered.
-	NetworkAddress string   `json:"network_address"`
-	IsEnabled    bool       `json:"is_enabled"`
-	Endpoints    []Endpoint `json:"endpoints"`
-	GroupIDs     []string   `json:"group_ids"`
-	CreatedAt    string     `json:"created_at"`
-	UpdatedAt    string     `json:"updated_at"`
+	NetworkAddress string     `json:"network_address"`
+	IsEnabled      bool       `json:"is_enabled"`
+	Endpoints      []Endpoint `json:"endpoints"`
+	GroupIDs       []string   `json:"group_ids"`
+	CreatedAt      string     `json:"created_at"`
+	UpdatedAt      string     `json:"updated_at"`
 }
 
 type Group struct {
@@ -109,35 +128,33 @@ type GroupUser struct {
 }
 
 type Candidate struct {
-	ID               string `json:"id"`
-	Source           string `json:"source"`
-	DiscoveredURI    string `json:"discovered_uri"`
-	Kind             string `json:"kind"`
-	Host             string `json:"host"`
-	Port             int    `json:"port"`
-	Path             string `json:"path"`
-	DedupeKey        string `json:"dedupe_key"`
-	MAC              string `json:"mac,omitempty"`
-	Vendor           string `json:"vendor,omitempty"`
-	Model            string `json:"model,omitempty"`
-	SerialNumber     string `json:"serial_number,omitempty"`
-	Raw              any    `json:"raw_json,omitempty"`
-	Direct           bool   `json:"direct"`
-	NeedsAgent       bool   `json:"needs_agent"`
+	ID            string `json:"id"`
+	Source        string `json:"source"`
+	DiscoveredURI string `json:"discovered_uri"`
+	Kind          string `json:"kind"`
+	Host          string `json:"host"`
+	Port          int    `json:"port"`
+	Path          string `json:"path"`
+	DedupeKey     string `json:"dedupe_key"`
+	MAC           string `json:"mac,omitempty"`
+	Vendor        string `json:"vendor,omitempty"`
+	Model         string `json:"model,omitempty"`
+	SerialNumber  string `json:"serial_number,omitempty"`
+	Raw           any    `json:"raw_json,omitempty"`
+	Direct        bool   `json:"direct"`
 	// ProbeAttempted separates "we asked and it cannot take PDF" from "we
-	// could not reach it at all". The UI must not tell a user to install a
-	// helper on another PC just because the printer was switched off.
-	ProbeAttempted bool `json:"probe_attempted"`
+	// could not reach it at all". A device that is merely switched off must
+	// not be reported as missing a driver.
+	ProbeAttempted   bool   `json:"probe_attempted"`
 	Status           string `json:"status"`
 	PossibleIPChange bool   `json:"possible_ip_change"`
 	MergedPrinterID  string `json:"merged_printer_id,omitempty"`
 	// AlreadyAdded is filled in by the API, not stored. It lets the page hide
-	// devices that are already registered even when the endpoint is a Windows
-	// helper URI and therefore has no IP to compare against.
+	// devices that are already registered.
 	AlreadyAdded bool   `json:"already_added"`
 	PrinterName  string `json:"printer_name,omitempty"`
-	FirstSeenAt      string `json:"first_seen_at"`
-	LastSeenAt       string `json:"last_seen_at"`
+	FirstSeenAt  string `json:"first_seen_at"`
+	LastSeenAt   string `json:"last_seen_at"`
 }
 
 type StoredFile struct {
@@ -155,51 +172,36 @@ type StoredFile struct {
 }
 
 type Job struct {
-	ID            string `json:"id"`
-	UserID        string `json:"user_id"`
-	Username      string `json:"username,omitempty"`
-	PrinterID     string `json:"printer_id"`
-	PrinterName   string `json:"printer_name,omitempty"`
-	EndpointID    string `json:"endpoint_id,omitempty"`
-	EndpointURI   string `json:"endpoint_uri,omitempty"`
-	AgentID       string `json:"agent_id,omitempty"`
-	OriginalFile  string `json:"original_file_id,omitempty"`
-	PDFFile       string `json:"pdf_file_id,omitempty"`
-	FileName      string `json:"file_name,omitempty"`
-	Status        string `json:"status"`
-	Copies        int    `json:"copies"`
-	Duplex        string `json:"duplex"`
-	ColorMode     string `json:"color_mode"`
-	PaperSize     string `json:"paper_size"`
-	PageCount     int    `json:"page_count"`
-	ErrorCode     string `json:"error_code,omitempty"`
-	ErrorMessage  string `json:"error_message,omitempty"`
-	RetryOf       string `json:"retry_of,omitempty"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedAt     string `json:"updated_at"`
-	ClaimedAt     string `json:"claimed_at,omitempty"`
-	LeaseExpires  string `json:"lease_expires_at,omitempty"`
-	StartedAt     string `json:"started_at,omitempty"`
-	FinishedAt    string `json:"finished_at,omitempty"`
-	TotalPages    int    `json:"total_pages"`
-	AgentEndpoint bool   `json:"-"`
-	PDFPath       string `json:"-"`
-	QueueName     string `json:"queue_name,omitempty"`
-}
-
-type Agent struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	Version      string   `json:"version"`
-	PrintCommand string   `json:"print_command"`
-	LastSeenAt   string   `json:"last_seen_at,omitempty"`
-	Queues       any      `json:"queues"`
-	Status       any      `json:"status"`
-	IsActive     bool     `json:"is_active"`
-	CreatedAt    string   `json:"created_at"`
-	Online       bool     `json:"online"`
-	EndpointIDs  []string `json:"endpoint_ids,omitempty"`
-	PrinterIDs   []string `json:"printer_ids,omitempty"`
+	ID           string `json:"id"`
+	UserID       string `json:"user_id"`
+	Username     string `json:"username,omitempty"`
+	PrinterID    string `json:"printer_id"`
+	PrinterName  string `json:"printer_name,omitempty"`
+	EndpointID   string `json:"endpoint_id,omitempty"`
+	EndpointURI  string `json:"endpoint_uri,omitempty"`
+	OriginalFile string `json:"original_file_id,omitempty"`
+	PDFFile      string `json:"pdf_file_id,omitempty"`
+	FileName     string `json:"file_name,omitempty"`
+	Status       string `json:"status"`
+	Copies       int    `json:"copies"`
+	Duplex       string `json:"duplex"`
+	ColorMode    string `json:"color_mode"`
+	PaperSize    string `json:"paper_size"`
+	PageRange    string `json:"page_range,omitempty"`
+	PageCount    int    `json:"page_count"`
+	ErrorCode    string `json:"error_code,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	RetryOf      string `json:"retry_of,omitempty"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
+	ClaimedAt    string `json:"claimed_at,omitempty"`
+	LeaseExpires string `json:"lease_expires_at,omitempty"`
+	StartedAt    string `json:"started_at,omitempty"`
+	FinishedAt   string `json:"finished_at,omitempty"`
+	TotalPages   int    `json:"total_pages"`
+	PDFPath      string `json:"-"`
+	QueueName    string `json:"queue_name,omitempty"`
+	CUPSJobID    string `json:"cups_job_id,omitempty"`
 }
 
 type DiscoveryRun struct {
@@ -232,8 +234,8 @@ type Dashboard struct {
 	FailedJobsToday int            `json:"failed_jobs_today"`
 	CompletedToday  int            `json:"completed_today"`
 	NewCandidates   int            `json:"new_candidates"`
-	AgentsOnline    int            `json:"agents_online"`
-	AgentsTotal     int            `json:"agents_total"`
+	CUPSReady       int            `json:"cups_ready"`
+	CUPSTotal       int            `json:"cups_total"`
 	RecentJobs      []Job          `json:"recent_jobs"`
 	StatusCounts    map[string]int `json:"status_counts"`
 	DailyPages      int            `json:"daily_pages"`
@@ -242,10 +244,11 @@ type Dashboard struct {
 }
 
 type JobFilter struct {
-	UserID   string
-	Statuses []string
-	Limit    int
-	Offset   int
+	UserID    string
+	PrinterID string
+	Statuses  []string
+	Limit     int
+	Offset    int
 }
 
 func Now() string { return time.Now().UTC().Format(time.RFC3339) }

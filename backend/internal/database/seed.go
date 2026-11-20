@@ -58,14 +58,14 @@ func seedProfiles(ctx context.Context, st *store.Store) error {
 	nb, _ := json.Marshal(notes)
 	_, err := st.DB.ExecContext(ctx, `INSERT INTO printer_profiles
 		(id, vendor, model_pattern, transports_json, capabilities_json, notes, is_builtin, created_at)
-		VALUES ('pantum-ms6000nw', 'Pantum', 'MS6000NW*', '["ipp","socket","agent"]', ?, ?, 1, ?)
+		VALUES ('pantum-ms6000nw', 'Pantum', 'MS6000NW*', '["ipp","cups"]', ?, ?, 1, ?)
 		ON CONFLICT(id) DO NOTHING`, string(b), string(nb), now)
 	if err != nil {
 		return fmt.Errorf("seed printer profile: %w", err)
 	}
 	_, err = st.DB.ExecContext(ctx, `INSERT INTO printer_profiles
 		(id, vendor, model_pattern, transports_json, capabilities_json, notes, is_builtin, created_at)
-		VALUES ('generic-ipp-pdf', '', '*', '["ipp","agent"]', '{"paper_sizes":["A4"],"duplex_modes":["one-sided","two-sided-long-edge","two-sided-short-edge"],"color_modes":["monochrome","color"]}', '["通用 IPP 档案：实际能力以端点探测为准。"]', 1, ?)
+		VALUES ('generic-ipp-pdf', '', '*', '["ipp","cups"]', '{"paper_sizes":["A4"],"duplex_modes":["one-sided","two-sided-long-edge","two-sided-short-edge"],"color_modes":["monochrome","color"]}', '["通用 IPP 档案：实际能力以端点探测为准。", "不直接接收 PDF 的机型用 CUPS 队列加厂商驱动。"]', 1, ?)
 		ON CONFLICT(id) DO NOTHING`, now)
 	if err != nil {
 		return fmt.Errorf("seed generic profile: %w", err)

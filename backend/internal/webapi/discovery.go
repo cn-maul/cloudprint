@@ -2,8 +2,9 @@ package webapi
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"net"
+	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -11,12 +12,12 @@ import (
 	"sync"
 	"time"
 
-	"cloudprint/internal/auth"
+	"cloudprint/internal/cups"
+	"cloudprint/internal/ipp"
 	"cloudprint/internal/printer/discovery"
 	"cloudprint/internal/store"
 
 	"github.com/go-chi/chi/v5"
-	"net/http"
 )
 
 func (s *Server) handleCandidates(w http.ResponseWriter, r *http.Request) {
@@ -140,15 +141,10 @@ func parseCandidateURI(raw, kind string) (discovery.Found, error) {
 		kind = "ipp"
 	}
 	if kind == "socket" {
-		return discovery.Found{}, errString("RAW 9100 无法直接解释 PDF，请改用 Windows 代理端点")
+		return discovery.Found{}, errString("RAW 9100 无法解释 PDF，请改用 CUPS 队列接入")
 	}
-	if kind != "ipp" && kind != "agent" {
-		return discovery.Found{}, errString("端点类型必须是 ipp 或 agent")
-	}
-	if kind == "agent" {
-		return discovery.Found{
-			URI: raw, Kind: kind, Host: raw, Port: 0, Path: "",
-		}, nil
+	if kind != "ipp" {
+		return discovery.Found{}, errString("端点类型必须是 ipp")
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -232,7 +228,16 @@ func (s *Server) handleApproveCandidate(w http.ResponseWriter, r *http.Request) 
 		Kind: c.Kind, URI: c.DiscoveredURI, Priority: in.Priority,
 		MAC: c.MAC, SerialNumber: c.SerialNumber,
 	})
-	if err != nil && err != store.ErrConflict {
+	if errors.Is(err, store.ErrConflict) {
+		existing, getErr := s.Store.GetEndpointByDedupe(r.Context(), store.DedupeKey(c.Kind, c.DiscoveredURI))
+		if getErr != nil {
+			writeErr(w, http.StatusConflict, "ENDPOINT_EXISTS", "这个地址已经接入过，请刷新页面查看")
+			return
+		}
+		ep = existing
+		err = nil
+	}
+	if err != nil {
 		s.jsonError(w, err)
 		return
 	}
@@ -240,7 +245,7 @@ func (s *Server) handleApproveCandidate(w http.ResponseWriter, r *http.Request) 
 	s.Store.Audit(r.Context(), currentUser(r).ID, "approve_candidate", "candidate", c.ID, map[string]any{
 		"printer_id": printerID, "endpoint_id": ep.ID,
 	})
-	if ep != nil && (in.Probe == nil || *in.Probe) {
+	if in.Probe == nil || *in.Probe {
 		go func() {
 			probe := s.Printer.Probe(context.Background(), ep)
 			s.Log.Info("approved endpoint probed", "endpoint", ep.ID, "health", probe.Health)
@@ -412,7 +417,7 @@ func (s *Server) runDiscovery(runID, mode string, cidrs []string) {
 				probeCancel()
 				raw["probed"] = ok
 				raw["direct"] = ok && direct
-				raw["needs_agent"] = !ok || !direct
+				raw["needs_driver"] = ok && !direct
 				if model != "" {
 					if clean, ok := cleanModelName(model); ok {
 						item.Model = clean
@@ -424,7 +429,7 @@ func (s *Server) runDiscovery(runID, mode string, cidrs []string) {
 			}
 			if item.Kind == "socket" {
 				raw["direct"] = false
-				raw["needs_agent"] = true
+				raw["needs_driver"] = true
 			}
 			_, _, err := s.Store.UpsertCandidate(ctx, store.CandidateInput{
 				Source: item.Source, DiscoveredURI: item.URI, Kind: item.Kind, Host: item.Host,
@@ -528,18 +533,46 @@ func (s *Server) handleDiscoveryRuns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
 }
 
-// handleQuickAddPrinter is the one-click path used by the UI: create the
-// printer, attach the discovered address, probe it and report in plain language
-// whether it can print directly.
+// handleScanTargets suggests which subnets to scan, in the order most likely
+// to be right. A container only sees the Docker bridge, so the office LAN
+// usually has to come from an existing printer or the admin's own address.
+func (s *Server) handleScanTargets(w http.ResponseWriter, r *http.Request) {
+	printers, _ := s.Store.ListPrinters(r.Context(), true)
+	hosts := make([]string, 0, len(printers))
+	for _, p := range printers {
+		if p.NetworkAddress != "" {
+			hosts = append(hosts, p.NetworkAddress)
+		}
+	}
+	client := discovery.ClientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"))
+	list := discovery.SuggestCIDRs(s.Cfg.ScanCIDRs, hosts, client)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"targets":          discovery.FilterCandidateCIDRs(list),
+		"client_ip":        client,
+		"can_scan":         s.Cfg.AllowPrivateScan,
+		"configured_cidrs": s.Cfg.ScanCIDRs,
+	})
+}
+
+// handleQuickAddPrinter is the one-click path used by the UI. It probes the
+// device, then picks one of three Linux-native routes:
+//
+//   - the device accepts PDF over IPP  -> schedule it directly
+//   - it speaks PWG-Raster/URF         -> driverless CUPS queue
+//   - neither                          -> CUPS queue with a vendor PPD
+//
+// There is no Windows relay any more; CUPS plus the vendor driver is the
+// equivalent, and it runs on the same Linux host as CloudPrint.
 func (s *Server) handleQuickAddPrinter(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		DisplayName string `json:"display_name"`
 		Location    string `json:"location"`
 		URI         string `json:"uri"`
+		Host        string `json:"host"`
 		Vendor      string `json:"vendor"`
 		Model       string `json:"model"`
-		Mode        string `json:"mode"`
-		HelperName  string `json:"helper_name"`
+		PPD         string `json:"ppd"`
+		DriverMode  string `json:"driver_mode"`
 		CandidateID string `json:"candidate_id"`
 		PrinterID   string `json:"printer_id"`
 	}
@@ -552,7 +585,24 @@ func (s *Server) handleQuickAddPrinter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rawURI := strings.TrimSpace(in.URI)
+	if rawURI == "" {
+		rawURI = strings.TrimSpace(in.Host)
+	}
+	if rawURI == "" {
+		writeErr(w, http.StatusBadRequest, "URI_REQUIRED", "请填写打印机 IP 地址")
+		return
+	}
+	if !strings.Contains(rawURI, "://") {
+		rawURI = "ipp://" + strings.TrimSuffix(rawURI, "/") + "/ipp/print"
+	}
+	f, err := parseCandidateURI(rawURI, "ipp")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "URI_INVALID", err.Error())
+		return
+	}
+
 	var p *store.Printer
+	created := false
 	if in.PrinterID != "" {
 		existing, err := s.Store.GetPrinter(r.Context(), in.PrinterID)
 		if err != nil {
@@ -562,7 +612,7 @@ func (s *Server) handleQuickAddPrinter(w http.ResponseWriter, r *http.Request) {
 		p = existing
 		_ = s.Store.UpdatePrinter(r.Context(), p.ID, &name, &in.Location, nil, nil, nil, nil)
 	} else {
-		created, err := s.Store.CreatePrinter(r.Context(), store.NewPrinter{
+		made, err := s.Store.CreatePrinter(r.Context(), store.NewPrinter{
 			DisplayName: name,
 			Location:    strings.TrimSpace(in.Location),
 			Vendor:      strings.TrimSpace(in.Vendor),
@@ -572,216 +622,161 @@ func (s *Server) handleQuickAddPrinter(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "PRINTER_INVALID", err.Error())
 			return
 		}
-		p = created
+		p = made
+		created = true
 	}
-	if host := candidateHost(rawURI); host != "" {
+	cleanup := func() {
+		if created {
+			_ = s.Store.DeletePrinter(r.Context(), p.ID)
+		}
+	}
+	if host := candidateHost(f.URI); host != "" {
 		_ = s.Store.SetPrinterNetworkAddress(r.Context(), p.ID, host)
-		p.NetworkAddress = host
 	}
-	forceAgent := in.Mode == "agent" || strings.HasPrefix(strings.ToLower(rawURI), "socket://")
-	if !forceAgent && rawURI != "" {
-		f, err := parseCandidateURI(rawURI, "ipp")
-		if err != nil {
-			if in.PrinterID == "" {
-				_ = s.Store.DeletePrinter(r.Context(), p.ID)
+
+	// Everything below is decided by what the device actually reports. A model
+	// name taken from discovery can be stale or wrong, and picking a driver
+	// from the wrong device is how jobs silently vanish.
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	vendor := firstNonEmpty(in.Vendor, f.Vendor)
+	model := firstNonEmpty(in.Model, f.Model)
+	directPDF := false
+	driverless := false
+	if c, err := ipp.NewClient(f.URI, 15*time.Second); err == nil {
+		if msg, err := c.GetPrinterAttributes(ctx, []string{
+			"printer-make-and-model", "document-format-supported",
+		}); err == nil {
+			if mm := strings.TrimSpace(msg.String(ipp.TagPrinterAttributes, "printer-make-and-model")); mm != "" {
+				if clean, ok := cleanModelName(mm); ok {
+					model = firstNonEmpty(model, clean)
+				}
 			}
-			writeErr(w, http.StatusBadRequest, "URI_INVALID", err.Error())
-			return
-		}
-		probeCtx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
-		direct, model, vendor, probed := discovery.ProbeDirect(probeCtx, f.URI)
-		cancel()
-		if !probed {
-			// No answer at all: save the address and let the page say the
-			// printer is unreachable. Forcing a Windows helper here would ask
-			// the admin to install a program on a computer for a printer that
-			// may simply be switched off.
-			rawURI = f.URI
-		} else if !direct {
-			// The device answered but cannot consume PDF. Attach the Windows
-			// helper instead of leaving an endpoint that can never print.
-			forceAgent = true
-			if p.Model == "" {
-				p.Model = model
-			}
-			if p.Vendor == "" {
-				p.Vendor = vendor
-			}
-			_ = s.Store.UpdatePrinter(r.Context(), p.ID, nil, nil, &p.Vendor, &p.Model, nil, nil)
-		} else {
-			rawURI = f.URI
-		}
-	}
-	if forceAgent {
-		if in.PrinterID != "" {
-			// Reconnecting an old printer must not leave its previous dead
-			// endpoint enabled; otherwise the UI keeps showing "助手没运行".
-			// Rows are disabled, not deleted: historic jobs reference them.
-			if oldAgents, err := s.Store.DisablePrinterEndpoints(r.Context(), p.ID); err == nil {
-				for _, id := range oldAgents {
-					_ = s.Store.DeactivateAgent(r.Context(), id)
+			for _, format := range msg.Strings(ipp.TagPrinterAttributes, "document-format-supported") {
+				if format == "application/pdf" || format == "*/*" {
+					directPDF = true
+				}
+				// IPP Everywhere / AirPrint devices accept PWG-Raster or URF.
+				// CUPS can drive them with the "everywhere" PPD, which is
+				// generic and survives driver updates.
+				if format == "image/pwg-raster" || format == "image/urf" {
+					driverless = true
 				}
 			}
 		}
-		setup, err := s.createAgentForPrinter(r, p, strings.TrimSpace(in.HelperName))
+	}
+	_ = s.Store.UpdatePrinter(r.Context(), p.ID, nil, nil, &vendor, &model, nil, nil)
+
+	if directPDF && strings.TrimSpace(in.PPD) == "" {
+		_ = s.Store.DisablePrinterEndpoints(r.Context(), p.ID)
+		ep, err := s.Store.EnablePrinterEndpoint(r.Context(), p.ID, "ipp", f.URI)
 		if err != nil {
-			if in.PrinterID == "" {
-				_ = s.Store.DeletePrinter(r.Context(), p.ID)
-			}
-			s.jsonError(w, err)
+			cleanup()
+			writeErr(w, http.StatusBadRequest, "ENDPOINT_INVALID", err.Error())
 			return
 		}
-		updated, _ := s.Store.GetPrinter(r.Context(), p.ID)
+		res := s.Printer.Probe(ctx, ep)
 		s.Store.Audit(r.Context(), currentUser(r).ID, "quick_add_printer", "printer", p.ID, map[string]any{
-			"uri": rawURI, "mode": "agent", "endpoint": setup["endpoint_id"],
+			"uri": f.URI, "mode": "ipp", "health": res.Health,
 		})
+		updated, _ := s.Store.GetPrinter(r.Context(), p.ID)
 		writeJSON(w, http.StatusCreated, map[string]any{
-			"printer": updated,
-			"direct":  false,
-			"mode":    "agent",
-			"message": "打印机已保存。还差一步：在一台能正常打印它的 Windows 电脑上运行安装命令。",
-			"agent":   setup,
+			"printer": updated, "probe": res, "mode": "ipp", "direct": true,
+			"message": "已接入，可以直接打印",
 		})
 		if in.CandidateID != "" {
 			_ = s.Store.SetCandidateStatus(r.Context(), in.CandidateID, "approved", p.ID)
 		}
 		return
 	}
-	f, err := parseCandidateURI(rawURI, "ipp")
-	if err != nil {
-		if in.PrinterID == "" {
-			_ = s.Store.DeletePrinter(r.Context(), p.ID)
-		}
-		writeErr(w, http.StatusBadRequest, "URI_INVALID", err.Error())
+
+	// The device needs a driver. Match one by the model it reported unless the
+	// admin picked a PPD explicitly.
+	ok, reason := s.CUPS.Available()
+	if !ok {
+		cleanup()
+		writeErr(w, http.StatusConflict, "CUPS_UNAVAILABLE", reason)
 		return
 	}
-	if p.Vendor == "" {
-		p.Vendor = f.Vendor
+	ppdPath := strings.TrimSpace(in.PPD)
+	driverName := ""
+	if ppdPath != "" {
+		driverName = ppdPath
 	}
-	if p.Model == "" {
-		p.Model = f.Model
-	}
-	_ = s.Store.UpdatePrinter(r.Context(), p.ID, nil, nil, &p.Vendor, &p.Model, nil, nil)
-	ep, err := s.Store.EnablePrinterEndpoint(r.Context(), p.ID, "ipp", f.URI)
-	if err != nil {
-		if in.PrinterID == "" {
-			_ = s.Store.DeletePrinter(r.Context(), p.ID)
+	// A vendor PPD wins over driverless even when the device advertises
+	// PWG-Raster or URF. Those formats are only a claim: several network
+	// printers here answer with "document-format-error" for anything but their
+	// own dialect, and the DRIVERLESS queue then swallows every job. A matched
+	// PPD names the one filter that actually works with this hardware.
+	if ppdPath == "" {
+		if best := s.CUPS.MatchPPD(model); best != nil {
+			ppdPath = best.Path
+			driverName = best.Name
 		}
-		if err == store.ErrConflict {
-			writeErr(w, http.StatusConflict, "ENDPOINT_EXISTS", "这个地址已经被另一台打印机使用，请检查是否重复添加")
+	}
+	useDriverless := ppdPath == "" && driverless && !strings.EqualFold(in.DriverMode, "ppd")
+	if ppdPath == "" {
+		if !useDriverless {
+			cleanup()
+			writeErr(w, http.StatusConflict, "DRIVER_REQUIRED",
+				"这台打印机不接收 PDF，也不支持无驱（PWG-Raster/URF）协议，系统里没有匹配的驱动。请先安装厂商 Linux 驱动（PPD），再重新添加。")
 			return
 		}
+		driverName = "IPP Everywhere（无驱）"
+	}
+	queue, err := s.CUPS.UniqueQueueName(ctx, p.DisplayName, p.ID, f.URI)
+	if err != nil {
+		cleanup()
+		writeErr(w, http.StatusBadGateway, "CUPS_LIST_FAILED",
+			"无法读取 CUPS 队列列表："+err.Error())
+		return
+	}
+	if err := s.CUPS.Create(ctx, cups.CreateOptions{
+		Name:      queue,
+		DeviceURI: f.URI,
+		PPD:       ppdPath,
+		Location:  p.Location,
+		Info:      p.DisplayName,
+	}); err != nil {
+		cleanup()
+		writeErr(w, http.StatusBadGateway, "CUPS_CREATE_FAILED", "创建 CUPS 队列失败："+err.Error())
+		return
+	}
+	_ = s.Store.DisablePrinterEndpoints(r.Context(), p.ID)
+	ep, err := s.Store.EnablePrinterEndpoint(r.Context(), p.ID, "cups", queue)
+	if err != nil {
+		cleanup()
 		writeErr(w, http.StatusBadRequest, "ENDPOINT_INVALID", err.Error())
 		return
 	}
-	if in.PrinterID != "" {
-		// Switching a printer from a Windows helper back to a network address
-		// must retire the other endpoints, otherwise two paths stay enabled
-		// and the page may report the wrong reason when printing fails. Do it
-		// after the new endpoint resolved, so a conflict cannot leave the
-		// printer with nothing enabled.
-		if oldAgents, err := s.Store.DisablePrinterEndpoints(r.Context(), p.ID); err == nil {
-			for _, id := range oldAgents {
-				_ = s.Store.DeactivateAgent(r.Context(), id)
-			}
-		}
-		ep, err = s.Store.EnablePrinterEndpoint(r.Context(), p.ID, "ipp", f.URI)
-		if err != nil {
-			s.jsonError(w, err)
-			return
-		}
+	_ = s.Store.SetEndpointQueue(r.Context(), ep.ID, queue, queue, driverName)
+	// SetEndpointQueue fills in queue_name, which probeCUPS needs. Reload so the
+	// probe does not use the pre-update copy with an empty queue name.
+	if fresh, getErr := s.Store.GetEndpoint(r.Context(), ep.ID); getErr == nil {
+		ep = fresh
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
 	res := s.Printer.Probe(ctx, ep)
 	s.Store.Audit(r.Context(), currentUser(r).ID, "quick_add_printer", "printer", p.ID, map[string]any{
-		"uri": f.URI, "health": res.Health,
+		"uri": f.URI, "mode": "cups", "queue": queue, "ppd": driverName,
 	})
 	updated, _ := s.Store.GetPrinter(r.Context(), p.ID)
-	direct := res.Health == "healthy" && res.Capabilities.SupportsPDF()
-	message := "已添加，可以直接发起打印"
-	if !direct {
-		switch {
-		case res.Health == "down":
-			message = "已保存，但现在连不上这台打印机。请检查它是否开机、IP 是否变化。"
-		case !res.Capabilities.SupportsPDF():
-			message = "这台打印机不支持直接接收 PDF。请在一台装有它驱动的 Windows 电脑上安装打印助手。"
-		default:
-			message = "已保存，但设备状态异常：" + res.Error
-		}
+	message := "已用 CUPS 驱动（" + driverName + "）接入，可以直接打印"
+	if res.Health != "healthy" {
+		message = "CUPS 队列已创建，但打印机现在没响应。请检查它是否开机、IP 是否变化。"
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"printer": updated,
-		"probe":   res,
-		"direct":  direct,
-		"mode":    "direct",
-		"message": message,
+		"printer": updated, "probe": res, "mode": "cups", "direct": false,
+		"queue": queue, "driver": driverName, "message": message,
 	})
 	if in.CandidateID != "" {
 		_ = s.Store.SetCandidateStatus(r.Context(), in.CandidateID, "approved", p.ID)
 	}
 }
 
-func (s *Server) createAgentForPrinter(r *http.Request, p *store.Printer, windowsQueue string) (map[string]any, error) {
-	// Keep the generated name short and human-readable; the page shows it as
-	// "which Windows PC is relaying this printer". A random suffix is still
-	// needed because agent names are unique.
-	name := "转发：" + p.DisplayName + "-" + strings.ToUpper(auth.RandomToken(2))
-	token := auth.RandomToken(32)
-	command := `powershell -NoProfile -Command Start-Process -FilePath %s -Verb Print`
-	if windowsQueue != "" {
-		command = fmt.Sprintf(`powershell -NoProfile -Command Start-Process -FilePath %%s -Verb PrintTo -ArgumentList '%s'`,
-			strings.ReplaceAll(windowsQueue, "'", "''"))
-	}
-	agent, err := s.Store.CreateAgent(r.Context(), name, auth.HashToken(token), command)
-	if err != nil {
-		return nil, err
-	}
-	ep, err := s.Store.RebindAgentEndpoint(r.Context(), p.ID, agent.ID, windowsQueue)
-	if err != nil {
-		_ = s.Store.DeactivateAgent(r.Context(), agent.ID)
-		return nil, err
-	}
-	base := s.baseURL(r)
-	download := base + "/downloads/cloudprint-agent.exe"
-	setup := agentSetupScript(base, token, ep.ID)
-	return map[string]any{
-		"id":           agent.ID,
-		"name":         agent.Name,
-		"token":        token,
-		"endpoint_id":  ep.ID,
-		"download_url": download,
-		"setup_script": setup,
-	}, nil
-}
-
-// agentSetupScript is shared by quick-add and token rotation. The print
-// command stays on the server and is delivered when a job is claimed, so no
-// user path can break it by embedding spaces or quotes in a scheduled task.
-func agentSetupScript(base, token, endpointID string) string {
-	taskName := "CloudPrintAgent-" + endpointID
-	if len(endpointID) > 6 {
-		taskName = "CloudPrintAgent-" + endpointID[len(endpointID)-6:]
-	}
-return fmt.Sprintf(`# 在这台 Windows 电脑上运行一次
-$ErrorActionPreference = "Stop"
-$dir = Join-Path $env:LOCALAPPDATA "CloudPrintAgent"
-New-Item -ItemType Directory -Force -Path $dir | Out-Null
-$exe = Join-Path $dir "cloudprint-agent.exe"
-Invoke-WebRequest "%s" -OutFile $exe
-$arg = '-server "%s" -token "%s" -endpoint "%s"'
-$action = New-ScheduledTaskAction -Execute $exe -Argument $arg
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-Register-ScheduledTask -TaskName '%s' -Action $action -Trigger $trigger -Description 'CloudPrint 打印转发' -Force | Out-Null
-Start-ScheduledTask -TaskName '%s'
-Write-Host '打印转发已安装并开始运行。' -ForegroundColor Green
-`, base+"/downloads/cloudprint-agent.exe", base, token, endpointID, taskName, taskName)
-}
-
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
-			return v
+			return strings.TrimSpace(v)
 		}
 	}
 	return ""

@@ -17,3 +17,4 @@ work/*.log
 work/pid
 work/
 
+backend/*.exe

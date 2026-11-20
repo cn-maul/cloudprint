@@ -4,14 +4,18 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"cloudprint/internal/files"
 	"cloudprint/internal/printer"
 	"cloudprint/internal/store"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 )
 
 func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +52,29 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if in.Copies <= 0 {
 		in.Copies = 1
 	}
-	required := file.PageCount * in.Copies
+	sel, pages, err := files.PageSelection(in.PageRange, file.PageCount)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "PAGE_RANGE_INVALID", err.Error())
+		return
+	}
+	fileForJob := file
+	if in.PageRange != "" && pages != file.PageCount {
+		sub, subErr := s.extractPagesForJob(r, file, sel, pages)
+		if subErr != nil {
+			writeErr(w, http.StatusUnprocessableEntity, "PAGE_EXTRACT_FAILED", subErr.Error())
+			return
+		}
+		fileForJob = sub
+	}
+	in.FileID = fileForJob.ID
+	in.PDFFileID = fileForJob.ID
+	in.Pages = pages
+	if in.PageRange != "" && pages == file.PageCount {
+		// "1-全部页" still prints the whole document; keep the label but do
+		// not create a duplicate PDF on disk.
+		in.PageRange = ""
+	}
+	required := pages * in.Copies
 	used, err := s.Store.PagesToday(r.Context(), u.ID)
 	if err != nil {
 		s.jsonError(w, err)
@@ -59,19 +85,24 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("今日剩余 %d 页，本次需要 %d 页。", maxInt(u.DailyPageQuota-used, 0), required))
 		return
 	}
-	if ep := printer.SelectEndpoint(p, in.Duplex, false); ep == nil {
+	if ep := printer.SelectEndpoint(p, in.Duplex); ep == nil {
 		// Queueing a job on a printer nobody can drive leaves the user staring
 		// at "waiting to print" forever. Say exactly which part is offline.
 		msg := "这台打印机现在连不上。请稍后再试，或联系管理员检查设备电源和网络。"
-		code := "PRINTER_OFFLINE"
 		for _, candidate := range p.Endpoints {
-			if candidate.IsEnabled && candidate.Kind == "agent" && candidate.Health != "healthy" {
-				msg = "转发用的 Windows 电脑上没有运行打印助手。请让管理员在那台电脑上启动助手后再打印。"
-				code = "HELPER_OFFLINE"
+			if !candidate.IsEnabled {
+				continue
+			}
+			if candidate.Kind == "cups" {
+				msg = "服务器的打印队列现在不可用。请让管理员在“服务器打印驱动”里检查 CUPS 队列是否正常。"
+				break
+			}
+			if candidate.Health != "healthy" && candidate.LastError != "" {
+				msg = candidate.LastError
 				break
 			}
 		}
-		writeErr(w, http.StatusConflict, code, msg)
+		writeErr(w, http.StatusConflict, "PRINTER_OFFLINE", msg)
 		return
 	}
 	job, err := s.Store.CreateJob(r.Context(), in)
@@ -89,6 +120,34 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, job)
 }
 
+// extractPagesForJob writes a PDF containing only the selected pages and
+// registers it as a file owned by the same user, so the normal job path can
+// print it without special-casing page ranges downstream (CUPS, IPP and the
+// device all just receive a complete PDF).
+func (s *Server) extractPagesForJob(r *http.Request, src *store.StoredFile, sel []string, pages int) (*store.StoredFile, error) {
+	u := currentUser(r)
+	dir := filepath.Join(s.Cfg.DataDir, "pdf")
+	name := "pages-" + uuid.NewString() + ".pdf"
+	out := filepath.Join(dir, name)
+	if err := s.Pipeline.ExtractPages(r.Context(), src.StoragePath, out, sel); err != nil {
+		return nil, err
+	}
+	st, err := os.Stat(out)
+	if err != nil {
+		return nil, err
+	}
+	sha, err := files.HashFile(out)
+	if err != nil {
+		return nil, err
+	}
+	sub, err := s.Store.CreateFile(r.Context(), u.ID, "pdf", src.OriginalName,
+		"application/pdf", sha, out, st.Size(), pages, s.Cfg.RetentionDays)
+	if err != nil {
+		return nil, err
+	}
+	return sub, nil
+}
+
 func (s *Server) tryDispatch(jobID, userID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -104,23 +163,19 @@ func (s *Server) tryDispatch(jobID, userID string) {
 	if err != nil {
 		return
 	}
-	ep := printer.SelectEndpoint(p, job.Duplex, false)
+	ep := printer.SelectEndpoint(p, job.Duplex)
 	if ep == nil {
-		if hasAgentEndpoint(p) {
-			s.Hub.Publish(userID, "job.waiting_agent", job)
-		} else {
-			s.Hub.Publish(userID, "job.waiting", job)
-		}
-		return
-	}
-	if ep.Kind != "ipp" {
-		// Agent endpoints are claimed by the Windows agent; leave the job queued.
-		s.Hub.Publish(userID, "job.waiting_agent", job)
+		s.Hub.Publish(userID, "job.waiting", job)
 		return
 	}
 	res := s.Exec.Dispatch(ctx, job)
 	updated, err := s.Store.GetJob(ctx, jobID)
 	if err != nil {
+		return
+	}
+	if res.OK && updated.Status == "printing" {
+		// CUPS accepted the file; the worker publishes completion when the
+		// spooler reports the job drained.
 		return
 	}
 	if res.OK {
@@ -130,20 +185,12 @@ func (s *Server) tryDispatch(jobID, userID string) {
 	}
 }
 
-// shouldServerDispatch is the worker-side gate. Agent jobs stay queued for the
-// Windows agent to claim, instead of being failed by the server.
+// shouldServerDispatch is the worker-side gate. Both endpoints are driven from
+// this process now: ipp goes straight to the device, cups goes through the
+// local spooler and its vendor PPD.
 func shouldServerDispatch(p *store.Printer, duplex string) bool {
-	ep := printer.SelectEndpoint(p, duplex, false)
-	return ep != nil && ep.Kind == "ipp"
-}
-
-func hasAgentEndpoint(p *store.Printer) bool {
-	for _, ep := range p.Endpoints {
-		if ep.IsEnabled && ep.Kind == "agent" {
-			return true
-		}
-	}
-	return false
+	ep := printer.SelectEndpoint(p, duplex)
+	return ep != nil
 }
 
 func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
@@ -161,12 +208,47 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	if st := q.Get("status"); st != "" {
 		filter.Statuses = strings.Split(st, ",")
 	}
+	if pid := q.Get("printer_id"); pid != "" {
+		filter.PrinterID = pid
+	}
 	jobs, total, err := s.Store.ListJobs(r.Context(), filter)
 	if err != nil {
 		s.jsonError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs, "total": total, "limit": filter.Limit, "offset": filter.Offset})
+}
+
+// handleClearJobs drops a printer's finished history. It exists because the
+// queue view is also the troubleshooting view: once a fault is understood, the
+// old failed rows only get in the way of reading the current state.
+//
+// Running work is never touched. The response reports what was removed so the
+// UI can say something concrete instead of just "done".
+func (s *Server) handleClearJobs(w http.ResponseWriter, r *http.Request) {
+	u := currentUser(r)
+	printerID := chi.URLParam(r, "id")
+	if _, err := s.Store.GetPrinter(r.Context(), printerID); err != nil {
+		writeErr(w, http.StatusNotFound, "PRINTER_NOT_FOUND", "打印机不存在")
+		return
+	}
+	allowed, err := s.Store.UserCanUsePrinter(r.Context(), u.ID, u.Role, printerID)
+	if err != nil {
+		s.jsonError(w, err)
+		return
+	}
+	if !allowed {
+		writeErr(w, http.StatusForbidden, "PRINTER_FORBIDDEN", "没有这台打印机的使用权限")
+		return
+	}
+	n, err := s.Store.ClearFinishedJobs(r.Context(), printerID)
+	if err != nil {
+		s.jsonError(w, err)
+		return
+	}
+	s.Store.Audit(r.Context(), u.ID, "clear_jobs", "printer", printerID,
+		map[string]any{"removed": n})
+	writeJSON(w, http.StatusOK, map[string]any{"removed": n})
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
@@ -193,6 +275,27 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	}
 	if job.UserID != u.ID && u.Role != "admin" {
 		writeErr(w, http.StatusForbidden, "FORBIDDEN", "无权取消该任务")
+		return
+	}
+	if job.Status == "printing" && job.CUPSJobID != "" && s.CUPS != nil {
+		// The job is already in cupsd. Cancel it there first; otherwise the
+		// database says "canceled" while the printer keeps printing.
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		err := s.CUPS.CancelJob(ctx, job.CUPSJobID)
+		cancel()
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "CUPS_CANCEL_FAILED",
+				"无法取消打印队列里的任务："+err.Error())
+			return
+		}
+		if err := s.Store.CancelSubmittedJob(r.Context(), id, "CANCELED", "用户取消了打印"); err != nil {
+			writeErr(w, http.StatusConflict, "CANCEL_REJECTED", err.Error())
+			return
+		}
+		s.Store.Audit(r.Context(), u.ID, "cancel", "job", id, map[string]any{"cups_job": job.CUPSJobID})
+		updated, _ := s.Store.GetJob(r.Context(), id)
+		s.Hub.Publish(job.UserID, "job.canceled", updated)
+		writeJSON(w, http.StatusOK, updated)
 		return
 	}
 	if err := s.Store.CancelJob(r.Context(), id, u.ID, u.Role == "admin"); err != nil {

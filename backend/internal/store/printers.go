@@ -89,30 +89,8 @@ func (s *Store) ListPrinters(ctx context.Context, includeDisabled bool) ([]Print
 			return nil, err
 		}
 		out[i].GroupIDs = gids
-		s.attachAgentNames(ctx, out[i].Endpoints)
 	}
 	return out, nil
-}
-
-// attachAgentNames lets the UI say "run the helper on 3F-PC" instead of
-// showing a raw agent id.
-func (s *Store) attachAgentNames(ctx context.Context, endpoints []Endpoint) {
-	if len(endpoints) == 0 {
-		return
-	}
-	agents, err := s.ListAgents(ctx)
-	if err != nil {
-		return
-	}
-	names := map[string]string{}
-	for _, a := range agents {
-		names[a.ID] = a.Name
-	}
-	for i := range endpoints {
-		if endpoints[i].AgentID != "" {
-			endpoints[i].AgentName = names[endpoints[i].AgentID]
-		}
-	}
 }
 
 func (s *Store) GetPrinter(ctx context.Context, id string) (*Printer, error) {
@@ -133,19 +111,18 @@ func (s *Store) GetPrinter(ctx context.Context, id string) (*Printer, error) {
 	}
 	p.Endpoints = eps
 	p.GroupIDs, _ = s.PrinterGroupIDs(ctx, p.ID)
-	s.attachAgentNames(ctx, p.Endpoints)
 	return &p, nil
 }
 
 type NewPrinter struct {
-	DisplayName  string `json:"display_name"`
-	Location     string `json:"location"`
-	Vendor       string `json:"vendor"`
-	Model        string `json:"model"`
-	SerialNumber string `json:"serial_number"`
-	ProfileID    string `json:"profile_id"`
+	DisplayName    string `json:"display_name"`
+	Location       string `json:"location"`
+	Vendor         string `json:"vendor"`
+	Model          string `json:"model"`
+	SerialNumber   string `json:"serial_number"`
+	ProfileID      string `json:"profile_id"`
 	NetworkAddress string `json:"network_address"`
-	IsEnabled    *bool  `json:"is_enabled"`
+	IsEnabled      *bool  `json:"is_enabled"`
 }
 
 func (s *Store) CreatePrinter(ctx context.Context, in NewPrinter) (*Printer, error) {
@@ -154,19 +131,19 @@ func (s *Store) CreatePrinter(ctx context.Context, in NewPrinter) (*Printer, err
 	}
 	now := Now()
 	p := Printer{
-		ID:           "pr_" + uuid.NewString(),
-		DisplayName:  strings.TrimSpace(in.DisplayName),
-		Location:     strings.TrimSpace(in.Location),
-		Vendor:       strings.TrimSpace(in.Vendor),
-		Model:        strings.TrimSpace(in.Model),
-		SerialNumber: strings.TrimSpace(in.SerialNumber),
-		ProfileID:    strings.TrimSpace(in.ProfileID),
+		ID:             "pr_" + uuid.NewString(),
+		DisplayName:    strings.TrimSpace(in.DisplayName),
+		Location:       strings.TrimSpace(in.Location),
+		Vendor:         strings.TrimSpace(in.Vendor),
+		Model:          strings.TrimSpace(in.Model),
+		SerialNumber:   strings.TrimSpace(in.SerialNumber),
+		ProfileID:      strings.TrimSpace(in.ProfileID),
 		NetworkAddress: strings.TrimSpace(in.NetworkAddress),
-		IsEnabled:    true,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		Endpoints:    []Endpoint{},
-		GroupIDs:     []string{},
+		IsEnabled:      true,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Endpoints:      []Endpoint{},
+		GroupIDs:       []string{},
 	}
 	if in.IsEnabled != nil {
 		p.IsEnabled = *in.IsEnabled
@@ -314,7 +291,38 @@ func uriHostname(raw string) string {
 }
 
 func (s *Store) DeletePrinter(ctx context.Context, id string) error {
-	res, err := s.DB.ExecContext(ctx, `DELETE FROM printers WHERE id = ?`, id)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Active jobs cannot outlive their queue, so fail them before detaching.
+	// Finished history is kept: the printer name is snapshotted on the job and
+	// the foreign key is ON DELETE SET NULL.
+	if _, err := tx.ExecContext(ctx, `UPDATE print_jobs SET status = 'failed',
+		error_code = 'PRINTER_DELETED', error_message = '打印机已被删除，请重新选择打印机',
+		updated_at = ?, finished_at = ?
+		WHERE printer_id = ? AND status IN ('queued', 'printing', 'waiting')`,
+		Now(), Now(), id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE print_jobs SET endpoint_id = NULL,
+		printer_id = NULL WHERE printer_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM printer_endpoint_events
+		WHERE endpoint_id IN (SELECT id FROM printer_endpoints WHERE printer_id = ?)`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM printer_endpoints WHERE printer_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_group_printers WHERE printer_id = ?`, id); err != nil {
+		return err
+	}
+
+	res, err := tx.ExecContext(ctx, `DELETE FROM printers WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}
@@ -322,66 +330,15 @@ func (s *Store) DeletePrinter(ctx context.Context, id string) error {
 	if n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
-// DisablePrinterEndpoints is used when an administrator re-runs the setup for
-// an existing printer. It deliberately keeps the rows: print_jobs references
-// endpoint_id and agent_id, so a physical DELETE fails for any printer that
-// has ever printed. The agent ids are returned so the old helpers can be
-// deactivated.
-func (s *Store) DisablePrinterEndpoints(ctx context.Context, printerID string) ([]string, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT COALESCE(agent_id, '') FROM printer_endpoints
-		WHERE printer_id = ? AND agent_id IS NOT NULL`, printerID)
-	if err != nil {
-		return nil, err
-	}
-	var agents []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if id != "" {
-			agents = append(agents, id)
-		}
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if _, err := s.DB.ExecContext(ctx, `UPDATE printer_endpoints SET is_enabled = 0,
-		health_status = 'unknown', last_error = '', updated_at = ? WHERE printer_id = ?`,
-		Now(), printerID); err != nil {
-		return nil, err
-	}
-	return agents, nil
-}
-
-// RebindAgentEndpoint points the printer's existing agent endpoint at a new
-// helper, or creates one when the printer never had a helper. Reusing the row
-// keeps historic jobs intact and avoids the unique agent:// URI collision.
-func (s *Store) RebindAgentEndpoint(ctx context.Context, printerID, agentID, queueName string) (*Endpoint, error) {
-	row := s.DB.QueryRowContext(ctx, endpointSelect+` WHERE printer_id = ? AND kind = 'agent'
-		ORDER BY created_at DESC LIMIT 1`, printerID)
-	ep, err := scanEndpoint(row)
-	if err == nil {
-		_, err = s.DB.ExecContext(ctx, `UPDATE printer_endpoints SET agent_id = ?, queue_name = ?,
-			is_enabled = 1, health_status = 'unknown', last_checked_at = NULL,
-			last_success_at = NULL, last_error = '', updated_at = ? WHERE id = ?`,
-			agentID, strings.TrimSpace(queueName), Now(), ep.ID)
-		if err != nil {
-			return nil, err
-		}
-		return s.GetEndpoint(ctx, ep.ID)
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	return s.CreateEndpoint(ctx, printerID, NewEndpoint{
-		Kind: "agent", URI: "agent://cloudprint/" + printerID,
-		Priority: 100, AgentID: agentID, QueueName: queueName,
-	})
+// DisablePrinterEndpoints retires a printer's endpoints when the admin re-runs
+// setup. Rows are kept because historic jobs reference them.
+func (s *Store) DisablePrinterEndpoints(ctx context.Context, printerID string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE printer_endpoints SET is_enabled = 0,
+		last_error = '', updated_at = ? WHERE printer_id = ?`, Now(), printerID)
+	return err
 }
 
 // EnablePrinterEndpoint reuses an IPP endpoint that already exists for this
@@ -443,7 +400,7 @@ func (s *Store) ListEndpoints(ctx context.Context, printerID string) ([]Endpoint
 	return out, rows.Err()
 }
 
-const endpointSelect = `SELECT id, printer_id, kind, uri, dedupe_key, COALESCE(agent_id, ''),
+const endpointSelect = `SELECT id, printer_id, kind, uri, dedupe_key,
 	queue_name, protocol, mac, serial_number, priority, is_enabled, health_status,
 	COALESCE(last_checked_at, ''), COALESCE(last_success_at, ''), last_error,
 	capabilities_json, capabilities_source FROM printer_endpoints`
@@ -455,7 +412,7 @@ type rowScanner interface {
 func scanEndpoint(row rowScanner) (Endpoint, error) {
 	var ep Endpoint
 	var caps string
-	err := row.Scan(&ep.ID, &ep.PrinterID, &ep.Kind, &ep.URI, &ep.DedupeKey, &ep.AgentID,
+	err := row.Scan(&ep.ID, &ep.PrinterID, &ep.Kind, &ep.URI, &ep.DedupeKey,
 		&ep.QueueName, &ep.Protocol, &ep.MAC, &ep.SerialNumber, &ep.Priority,
 		&ep.IsEnabled, &ep.Health, &ep.LastCheckedAt, &ep.LastSuccessAt, &ep.LastError,
 		&caps, &ep.CapabilitySource)
@@ -463,7 +420,22 @@ func scanEndpoint(row rowScanner) (Endpoint, error) {
 		return ep, err
 	}
 	_ = json.Unmarshal([]byte(caps), &ep.Capabilities)
+	ep.DirectPDF = ep.Capabilities.SupportsPDF()
 	return ep, nil
+}
+
+// SetEndpointQueue records which CUPS queue and driver back an endpoint.
+func (s *Store) SetEndpointQueue(ctx context.Context, id, uri, queue, ppd string) error {
+	caps := Capabilities{
+		DocumentFormats: []string{"application/pdf"},
+		MakeModel:       ppd,
+		CheckedAt:       Now(),
+	}
+	body, _ := json.Marshal(caps)
+	_, err := s.DB.ExecContext(ctx, `UPDATE printer_endpoints SET uri = ?, queue_name = ?,
+		capabilities_json = ?, updated_at = ? WHERE id = ?`,
+		uri, queue, string(body), Now(), id)
+	return err
 }
 
 func (s *Store) GetEndpoint(ctx context.Context, id string) (*Endpoint, error) {
@@ -493,7 +465,6 @@ func (s *Store) GetEndpointByDedupe(ctx context.Context, key string) (*Endpoint,
 type NewEndpoint struct {
 	Kind         string `json:"kind"`
 	URI          string `json:"uri"`
-	AgentID      string `json:"agent_id"`
 	QueueName    string `json:"queue_name"`
 	Protocol     string `json:"protocol"`
 	MAC          string `json:"mac"`
@@ -507,11 +478,8 @@ func DedupeKey(kind, uri string) string {
 }
 
 func (s *Store) CreateEndpoint(ctx context.Context, printerID string, in NewEndpoint) (*Endpoint, error) {
-	if in.Kind == "socket" {
-		return nil, fmt.Errorf("RAW 9100 无法直接解释 PDF，请改用 Windows 代理端点")
-	}
-	if in.Kind != "ipp" && in.Kind != "agent" {
-		return nil, fmt.Errorf("端点类型必须是 ipp 或 agent")
+	if in.Kind != "ipp" && in.Kind != "cups" {
+		return nil, fmt.Errorf("端点类型必须是 ipp（打印机直连）或 cups（本机 CUPS 队列）")
 	}
 	uri := strings.TrimSpace(in.URI)
 	if uri == "" {
@@ -531,7 +499,6 @@ func (s *Store) CreateEndpoint(ctx context.Context, printerID string, in NewEndp
 		Kind:             in.Kind,
 		URI:              uri,
 		DedupeKey:        DedupeKey(in.Kind, uri),
-		AgentID:          strings.TrimSpace(in.AgentID),
 		QueueName:        strings.TrimSpace(in.QueueName),
 		Protocol:         strings.TrimSpace(in.Protocol),
 		MAC:              strings.ToLower(strings.TrimSpace(in.MAC)),
@@ -541,15 +508,11 @@ func (s *Store) CreateEndpoint(ctx context.Context, printerID string, in NewEndp
 		Health:           "unknown",
 		CapabilitySource: "inferred",
 	}
-	var agent any
-	if ep.AgentID != "" {
-		agent = ep.AgentID
-	}
 	_, err := s.DB.ExecContext(ctx, `INSERT INTO printer_endpoints
-		(id, printer_id, kind, uri, dedupe_key, agent_id, queue_name, protocol, mac, serial_number,
+		(id, printer_id, kind, uri, dedupe_key, queue_name, protocol, mac, serial_number,
 		priority, is_enabled, health_status, capabilities_json, capabilities_source, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', '{}', 'inferred', ?, ?)`,
-		ep.ID, ep.PrinterID, ep.Kind, ep.URI, ep.DedupeKey, agent, ep.QueueName,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', '{}', 'inferred', ?, ?)`,
+		ep.ID, ep.PrinterID, ep.Kind, ep.URI, ep.DedupeKey, ep.QueueName,
 		ep.Protocol, ep.MAC, ep.SerialNumber, ep.Priority, boolInt(enabled), now, now)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
@@ -650,15 +613,9 @@ func (s *Store) ListCandidates(ctx context.Context, status string) ([]Candidate,
 			if v, ok := m["direct"].(bool); ok {
 				c.Direct = v
 			}
-			if v, ok := m["needs_agent"].(bool); ok {
-				c.NeedsAgent = v
-			}
 			if v, ok := m["probed"].(bool); ok {
 				c.ProbeAttempted = v
 			}
-		}
-		if c.Kind == "socket" {
-			c.NeedsAgent = true
 		}
 		out = append(out, c)
 	}

@@ -74,6 +74,15 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", name, err)
 		}
+		// SQLite cannot rebuild a table that other tables reference while
+		// foreign keys are enforced, and PRAGMA foreign_keys is a no-op inside
+		// a transaction. Such migrations opt out with this marker.
+		if strings.HasPrefix(strings.TrimSpace(string(body)), "-- +no-transaction") {
+			if err := applyNoTxMigration(ctx, db, name, string(body)); err != nil {
+				return err
+			}
+			continue
+		}
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("begin migration %s: %w", name, err)
@@ -90,6 +99,37 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit migration %s: %w", name, err)
 		}
+	}
+	return nil
+}
+
+func applyNoTxMigration(ctx context.Context, db *sql.DB, name, body string) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("begin migration %s: %w", name, err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+		return fmt.Errorf("disable foreign keys for %s: %w", name, err)
+	}
+	if _, err := conn.ExecContext(ctx, body); err != nil {
+		_, _ = conn.ExecContext(ctx, `PRAGMA foreign_keys=ON`)
+		return fmt.Errorf("apply migration %s: %w", name, err)
+	}
+	// foreign_key_check reports rows that would break once enforcement resumes.
+	var violations int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil {
+		violations = 0
+	}
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=ON`); err != nil {
+		return fmt.Errorf("re-enable foreign keys for %s: %w", name, err)
+	}
+	if violations > 0 {
+		return fmt.Errorf("migration %s left %d foreign key violations", name, violations)
+	}
+	if _, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`,
+		name, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return fmt.Errorf("record migration %s: %w", name, err)
 	}
 	return nil
 }

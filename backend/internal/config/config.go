@@ -19,8 +19,8 @@ type Config struct {
 	AdminDisplayName     string
 	CookieSecure         bool
 	MaxUploadMB          int64
-	LibreOffice          string
 	PDFToPPM             string
+	CUPSHost             string
 	EnableMDNS           bool
 	ScanCIDRs            []string
 	SessionHours         int
@@ -29,6 +29,10 @@ type Config struct {
 	AllowPrivateScan     bool
 	TrustedProxyHeaders  bool
 	BootstrapGeneratedPW bool
+	// AnonymousMode serves every request as the bootstrap admin, with no
+	// login. It exists for a single-printer pilot where the box is reachable
+	// only from the office LAN; accounts and quotas stay unimplemented.
+	AnonymousMode bool
 }
 
 func Load() Config {
@@ -47,8 +51,8 @@ func Load() Config {
 		AdminDisplayName:  env("CLOUDPRINT_ADMIN_DISPLAY", "管理员"),
 		CookieSecure:      envBool("CLOUDPRINT_COOKIE_SECURE", false),
 		MaxUploadMB:       envInt64("CLOUDPRINT_MAX_UPLOAD_MB", 50),
-		LibreOffice:       os.Getenv("CLOUDPRINT_LIBREOFFICE"),
 		PDFToPPM:          os.Getenv("CLOUDPRINT_PDFTOPPM"),
+		CUPSHost:          env("CLOUDPRINT_CUPS_HOST", "127.0.0.1:631"),
 		EnableMDNS:        envBool("CLOUDPRINT_ENABLE_MDNS", true),
 		ScanCIDRs:         splitList(os.Getenv("CLOUDPRINT_SCAN_CIDRS")),
 		SessionHours:      int(envInt64("CLOUDPRINT_SESSION_HOURS", 12)),
@@ -59,6 +63,7 @@ func Load() Config {
 			"CLOUDPRINT_TRUST_PROXY_HEADERS",
 			false,
 		),
+		AnonymousMode: envBool("CLOUDPRINT_ANONYMOUS", false),
 	}
 	if c.AdminPassword == "" {
 		c.AdminPassword = randomPassword(18)

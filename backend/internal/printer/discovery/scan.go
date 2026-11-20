@@ -90,8 +90,8 @@ func (s Scanner) probeHost(ctx context.Context, ip, cidr string) (Found, bool) {
 	if !open[631] {
 		if open[9100] {
 			// RAW 9100 alone cannot be driven with PDF by the server, but it is
-			// almost always a printer. Surface it so the admin can attach it to
-			// a Windows machine that has the vendor driver.
+			// almost always a printer. Surface it so the admin can attach it as
+			// a CUPS queue on the server.
 			return Found{
 				Source: "scan",
 				URI:    "socket://" + net.JoinHostPort(ip, "9100"),
@@ -100,7 +100,7 @@ func (s Scanner) probeHost(ctx context.Context, ip, cidr string) (Found, bool) {
 				Port:   9100,
 				Path:   "",
 				Raw: map[string]any{
-					"cidr": cidr, "needs_agent": true, "raw_only": true,
+					"cidr": cidr, "raw_only": true,
 				},
 			}, true
 		}
@@ -153,7 +153,14 @@ func (s Scanner) probeHost(ctx context.Context, ip, cidr string) (Found, bool) {
 	}
 	location := strings.TrimSpace(msg.String(ipp.TagPrinterAttributes, "printer-location"))
 	f.Raw["print_directly"] = direct
-	f.Raw["needs_agent"] = !direct
+	driverless := false
+	for _, format := range formats {
+		if format == "image/pwg-raster" || format == "image/urf" {
+			driverless = true
+			break
+		}
+	}
+	f.Raw["needs_driver"] = !direct && !driverless
 	if location != "" {
 		f.Raw["location"] = location
 	}

@@ -4,7 +4,7 @@ import {api, setCSRF, type User} from "./lib/api";
 import Login from "./pages/Login";
 import Shell from "./components/Shell";
 
-export type Session = {user: User; csrf_token: string};
+export type Session = {user: User; csrf_token: string; anonymous?: boolean};
 
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
@@ -33,10 +33,7 @@ export default function App() {
     if (loading) {
       return (
         <div className="app-bg grid min-h-screen place-items-center">
-          <div className="flex items-center gap-3 text-sm text-muted">
-            <Spinner size="sm" />
-            正在载入 CloudPrint…
-          </div>
+          <Spinner size="sm" />
         </div>
       );
     }
@@ -61,7 +58,6 @@ export default function App() {
             setSession(null);
           }
         }}
-        onUserUpdate={(user) => setSession((prev) => (prev ? {...prev, user} : prev))}
       />
     );
   }, [loading, session]);

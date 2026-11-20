@@ -9,13 +9,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"cloudprint/internal/auth"
 	"cloudprint/internal/config"
+	"cloudprint/internal/cups"
 	"cloudprint/internal/files"
 	"cloudprint/internal/printer"
 	"cloudprint/internal/store"
@@ -28,6 +27,7 @@ type Server struct {
 	Cfg      config.Config
 	Store    *store.Store
 	Pipeline *files.Pipeline
+	CUPS     *cups.Client
 	Printer  *printer.Service
 	Exec     *printer.Executor
 	Limiter  *auth.Limiter
@@ -44,12 +44,22 @@ const (
 )
 
 func New(cfg config.Config, st *store.Store, pipeline *files.Pipeline, log *slog.Logger, ui fs.FS) *Server {
+	spooler := cups.New(cfg.CUPSHost)
+	exec := &printer.Executor{Store: st, CUPS: spooler}
+	// CUPS still owns the queue definitions, so it is the authority on which
+	// device a queue prints to. Documents bypass it entirely.
+	exec.DeviceURI = spooler.DeviceURI
+	// The queue's PPD names the vendor filter that turns our raster into the
+	// device's native stream. Find the PPD but still send the document
+	// ourselves, so page ranges and copies stay under our control.
+	exec.QueuePPD = spooler.QueuePPD
 	return &Server{
 		Cfg:      cfg,
 		Store:    st,
 		Pipeline: pipeline,
-		Printer:  &printer.Service{Store: st},
-		Exec:     &printer.Executor{Store: st},
+		CUPS:     spooler,
+		Printer:  &printer.Service{Store: st, CUPS: spooler},
+		Exec:     exec,
 		Limiter:  auth.NewLimiter(),
 		UI:       ui,
 		Hub:      NewEventHub(),
@@ -72,8 +82,6 @@ func (s *Server) Routes() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	r.Get("/readyz", s.handleReady)
-	r.Get("/downloads/cloudprint-agent.exe", s.handleAgentBinary)
-	r.Head("/downloads/cloudprint-agent.exe", s.handleAgentBinary)
 	if s.UI != nil {
 		if assets, err := fs.Sub(s.UI, "assets"); err == nil {
 			r.Handle("/assets/*", http.StripPrefix("/assets/", http.FileServer(http.FS(assets))))
@@ -91,6 +99,7 @@ func (s *Server) Routes() http.Handler {
 			r.Post("/auth/change-password", s.handleChangePassword)
 			r.Get("/dashboard", s.handleDashboard)
 			r.Get("/printers", s.handlePrintersPublic)
+			r.Get("/printers/{id}", s.handlePrinterDetail)
 			r.Post("/files", s.handleUpload)
 			r.Get("/files/{id}/preview", s.handlePreview)
 			r.Get("/files/{id}/download", s.handleDownload)
@@ -99,6 +108,7 @@ func (s *Server) Routes() http.Handler {
 			r.Get("/jobs/events", s.handleEvents)
 			r.Get("/jobs/{id}", s.handleGetJob)
 			r.Post("/jobs/{id}/cancel", s.handleCancelJob)
+			r.Post("/printers/{id}/jobs/clear", s.handleClearJobs)
 			r.Group(func(r chi.Router) {
 				r.Use(s.adminOnly)
 				r.Get("/admin/dashboard", s.adminDashboard)
@@ -129,43 +139,20 @@ func (s *Server) Routes() http.Handler {
 				r.Post("/admin/candidates/{id}/approve", s.handleApproveCandidate)
 				r.Post("/admin/candidates/{id}/ignore", s.handleIgnoreCandidate)
 				r.Post("/admin/discover", s.handleDiscover)
+				r.Get("/admin/scan-targets", s.handleScanTargets)
 				r.Post("/admin/printers/quick-add", s.handleQuickAddPrinter)
 				r.Get("/admin/discovery-runs", s.handleDiscoveryRuns)
-				r.Get("/admin/agents", s.handleAgents)
-				r.Post("/admin/agents", s.handleCreateAgent)
-				r.Post("/admin/agents/{id}/token", s.handleRotateAgentToken)
-				r.Delete("/admin/agents/{id}", s.handleDeleteAgent)
+				r.Get("/admin/cups/queues", s.handleCUPSQueues)
+				r.Get("/admin/cups/drivers", s.handleCUPSDrivers)
+				r.Post("/admin/cups/connect", s.handleCUPSConnect)
+				r.Delete("/admin/cups/queues/{name}", s.handleCUPSDeleteQueue)
 			})
 		})
-	})
-
-	r.Route("/api/agent", func(r chi.Router) {
-		r.Use(s.agentAuth)
-		r.Post("/heartbeat", s.handleAgentHeartbeat)
-		r.Post("/claim", s.handleAgentClaim)
-		r.Post("/jobs/{id}/start", s.handleAgentStart)
-		r.Post("/jobs/{id}/result", s.handleAgentResult)
-		r.Get("/files/{id}", s.handleAgentFile)
 	})
 
 	r.NotFound(s.handleSPA)
 	r.Get("/*", s.handleSPA)
 	return r
-}
-
-func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
-	exe, err := os.Executable()
-	if err != nil {
-		http.Error(w, "找不到程序目录", http.StatusInternalServerError)
-		return
-	}
-	path := filepath.Join(filepath.Dir(exe), "cloudprint-agent.exe")
-	if _, err := os.Stat(path); err != nil {
-		http.Error(w, "服务端目录里没有 cloudprint-agent.exe，请重新构建并一起部署", http.StatusNotFound)
-		return
-	}
-	w.Header().Set("Content-Disposition", `attachment; filename="cloudprint-agent.exe"`)
-	http.ServeFile(w, r, path)
 }
 
 func (s *Server) securityHeaders(next http.Handler) http.Handler {
@@ -199,16 +186,29 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":         "ready",
-		"libreoffice":    s.Pipeline.LibreOffice != "",
-		"pdf_preview":    s.Pipeline.PDFToPPM != "",
-		"office_formats": s.Pipeline.LibreOffice != "",
+		"status":      "ready",
+		"pdf_preview": s.Pipeline.PDFToPPM != "",
+		// V1 converts nothing: only PDF, JPEG and PNG are accepted.
+		"office_formats": false,
 		"max_upload_mb":  s.Cfg.MaxUploadMB,
 	})
 }
 
 func (s *Server) sessionAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Anonymous mode: the pilot box has no accounts. Every request acts as
+		// the bootstrap admin so uploads, jobs and printer state all keep their
+		// owner columns filled. CSRF is moot without a session cookie, so it is
+		// skipped too; this must only be enabled on a trusted LAN.
+		if s.Cfg.AnonymousMode {
+			u, err := s.Store.GetUserByUsername(r.Context(), s.Cfg.AdminUsername)
+			if err != nil {
+				writeErr(w, http.StatusServiceUnavailable, "NO_ANONYMOUS_USER", "匿名模式缺少默认用户")
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxUser, u)))
+			return
+		}
 		cookie, err := r.Cookie("cp_session")
 		if err != nil || cookie.Value == "" {
 			writeErr(w, http.StatusUnauthorized, "UNAUTHENTICATED", "请先登录")
@@ -244,32 +244,9 @@ func (s *Server) adminOnly(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) agentAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h := r.Header.Get("Authorization")
-		if !strings.HasPrefix(h, "Bearer ") {
-			writeErr(w, http.StatusUnauthorized, "AGENT_UNAUTHENTICATED", "代理令牌缺失")
-			return
-		}
-		token := strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
-		a, err := s.Store.GetAgentByToken(r.Context(), auth.HashToken(token))
-		if err != nil || !a.IsActive {
-			writeErr(w, http.StatusUnauthorized, "AGENT_UNAUTHENTICATED", "代理令牌无效")
-			return
-		}
-		ctx := context.WithValue(r.Context(), ctxUser, a)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
 func currentUser(r *http.Request) *store.User {
 	u, _ := r.Context().Value(ctxUser).(*store.User)
 	return u
-}
-
-func currentAgent(r *http.Request) *store.Agent {
-	a, _ := r.Context().Value(ctxUser).(*store.Agent)
-	return a
 }
 
 func isMutating(m string) bool {

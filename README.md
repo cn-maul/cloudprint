@@ -11,23 +11,23 @@ CloudPrint 服务负责排队、转换与派发。打印机地址与型号不写
 - 用户组授权：管理员建组、分配成员、授权打印机；普通用户只看到并只能用所属组授权
   的打印机，权限取多组并集；创建任务时后端再次强制校验
 - 打印机注册表：逻辑打印机 + 多端点 + 优先级 + 健康状态 + 能力探测
-- 端点类型：`ipp`（服务端直连）、`agent`（Windows 代理，原生驱动兜底）
+- 端点类型：`ipp`（设备原生支持 PDF 时直连）、`cups`（本机 CUPS 队列 + 厂商驱动）
 - 发现与审批：mDNS、受控 CIDR 扫描、手工候选；发现结果不会自动启用
-- 文件流水线：PDF 校验/页数、JPG/PNG 转 PDF、可选 LibreOffice 转 Office
+- 文件流水线：PDF 校验/页数、JPG/PNG 转 PDF（V1 不收 Office 文档）
 - 打印任务：排队、打印机级串行、状态机、SSE 实时推送、取消、每日页数额度
 - 每日额度按 NAS 本地时间的零点重置
 - 纯 Go IPP：Get-Printer-Attributes 探测、Validate/Print-Job、直接提交 PDF
-- Windows 代理：Bearer Token 领取任务；通过显式打印命令（启动参数或管理后台配置）出纸
+- Linux CUPS：探测队列状态、按机型自动匹配 PPD、`lp` 提交 PDF、任务号回写
 
 ## 重要边界
 
 - 型号只提供**能力档案**，不据此假定能打印 PDF。是否可 IPP 直打 PDF 一律以端点
   实际探测结果为准。
 - 服务端不会把 PDF 直接写到 RAW 9100。`socket://host:9100` 只能确认端口可达，不能
-  验证设备能否解析 PDF，因此不作为可调度端点；需要原生驱动时用 Windows 代理。
-- 已知奔图 MS6000NW 现场情况：Windows 原生驱动 + RAW 9100 可出纸；
-  WSD/IPP Class Driver 曾出现卡单（Error / Printing / Retained，PagesPrinted=0）。
-  因此对这台机器优先使用 Windows 代理端点。
+  验证设备能否解析 PDF。
+- 已知奔图 MS6000NW 只接受 `image/urf` / `image/pwg-raster` / `application/octet-stream`，
+  不接受 PDF。Linux 上用 CUPS 无驱队列（`-m everywhere`）出纸，不再需要 Windows
+  电脑中继。
 - 服务端不会修改打印机后台的任何设置，也不会自动发送测试页。
 
 ## 快速运行
@@ -54,7 +54,6 @@ go run .\cmd\cloudprint
 cd web; npm run build
 cd ..\backend
 go build -trimpath -o dist\cloudprint.exe .\cmd\cloudprint
-go build -trimpath -o dist\cloudprint-agent.exe .\cmd\agent
 ```
 
 ## NAS 部署（Docker）
@@ -65,9 +64,11 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-镜像包含 LibreOffice（DOCX/XLSX/PPTX 转换）与 poppler（PDF 预览）。数据持久化在
-`./data`，端口默认 `8080`。反向代理时请把 `CLOUDPRINT_PUBLIC_URL` 设为外部访问地址，
-并只在可信代理后开启 `CLOUDPRINT_TRUST_PROXY_HEADERS=true`。
+镜像包含 poppler（PDF 预览）与 CUPS；V1 只接受 PDF、JPG、PNG，Office 文档请先另存为 PDF。数据持久化在
+`./data`，端口默认 `8080`。`./data/cups`（队列与 PPD）、`./data/spool` 与
+`./data/cache`（CUPS 任务状态）都要保留，否则重建容器会丢队列、任务号也会从 1 重来。
+反向代理时请把 `CLOUDPRINT_PUBLIC_URL` 设为外部访问地址，并只在可信代理后开启
+`CLOUDPRINT_TRUST_PROXY_HEADERS=true`。
 
 群晖/威联通若使用 Container Manager，直接导入 `docker-compose.yml`，把 `./data`
 映射到 NAS 的共享文件夹，并给容器固定局域网 IP 或保留端口。
@@ -77,37 +78,53 @@ docker compose up -d --build
 1. **打印机 → 搜索打印机**。系统同时搜索局域网设备，通常 10–40 秒完成。
 2. 在结果里核对名字，点 **添加**。已添加过的打印机不会重复出现在搜索结果里；
    找不到时可以在 **手动添加** 里填打印机地址（例如 `192.168.2.91`）。
-3. 如果页面提示“需要一台电脑帮忙转发”，找一台**现在就能正常打印它**的 Windows
-   电脑，用管理员身份打开 PowerShell 7，把弹窗里的整段命令粘贴运行一次。之后那台
-   电脑保持开机即可。可以直接联网打印的机型不需要这一步。
+3. 如果设备不直接接收 PDF（例如奔图 MS6000NW），CloudPrint 会先看它是否支持
+   PWG-Raster / URF：支持就建无驱队列，不需要装任何厂商驱动；都不支持才去匹配
+   服务器上已安装的 PPD。全程不需要其他电脑常开。
 
 最后到 **成员与权限 → 新建分组**，勾选组员和打印机。普通用户只能看到并使用本组
 授权的设备。
 
 界面不使用 IPP、mDNS、端点等技术词。真实判定只看设备能否直接接收 PDF：不能直接
-接收的机型（包括奔图 MS6000NW）会显示为需要 Windows 电脑转发，避免任务提交成功
-却不出纸。检测过程只读，不打印测试页，也不修改打印机设置。
+接收的机型会显示为“需要服务器驱动”，由 CUPS 队列出纸，避免任务提交成功却不出纸。
+任务卡在“正在打印”时，界面会带上打印机自己上报的原因（缺纸、卡纸、盖板未关等）。
+检测过程只读，不打印测试页，也不修改打印机设置。
 
-## Windows 转发程序
+## CUPS 驱动
 
-转发程序运行在安装了打印机原生驱动、且能正常从 Windows 打印的电脑上。通常不需要
-手动创建：添加打印机时如果判定需要转发，页面会直接生成安装命令。
+Linux 上不需要 Windows 中继：CUPS 负责驱动和格式转换，CloudPrint 只上传、排队和
+提交 PDF。设备原生支持 PDF 时走 `ipp` 直连；否则在服务器上建 `cups` 队列。
 
-需要重新安装、换电脑或密钥丢失时，到 **成员与权限 → 帮忙转发的电脑** 点
-**重新生成安装命令**，旧密钥会立即作废。
+**优先无驱。** 支持 IPP Everywhere / AirPrint 的机型（PWG-Raster 或 URF）用
+`lpadmin -m everywhere` 建队列即可，不依赖任何厂商 filter，升级系统也不会失效。
+只有不支持无驱的老机型才需要装厂商 PPD。
 
-命令行方式（调试用）：
-```powershell
-.\cloudprint-agent.exe `
-  -server http://NAS地址:8080 `
-  -token 粘贴Token `
-  -endpoint ep_粘贴ID `
-  -print-command 'C:\Path\SumatraPDF.exe -silent -print-to "打印机名称" "%s"'
+安装系统打印机驱动集合：
+
+```bash
+sudo apt install cups cups-client cups-filters printer-driver-all openprinting-ppds
 ```
 
-`-print-command` 是实际打印动作，`%s`（或 `%FILE%`）会替换为下载后的 PDF 路径。
-正常安装命令由页面生成并写入计划任务，不需要手工写。未配置打印命令时任务会失败为
-`PRINT_COMMAND_MISSING`，不会伪装成功。
+奔图官方 Linux 驱动（含 337 个 PPD 与对应 filter），仅在老机型不支持无驱时才需要：
+
+```bash
+sudo ./deploy/install-pantum-driver.sh
+```
+
+脚本从奔图 CDN 下载官方包，把 PPD 装进 `/usr/share/cups/model/Pantum`、过滤器装进
+`/usr/lib/cups/filter`，并补上可执行位（官方 deb 里部分 filter 没有 exec 位，cupsd
+会报 `execv failed: Permission denied`）。之后在 **打印机 → 添加** 里重新接入，
+系统会按设备上报的型号自动匹配 PPD。
+
+容器里跑厂商 filter 有风险：奔图的 `ptm6500Filter` 在 Debian bookworm 容器内加载
+自带 CMS 库后会段错误。实测 MS6000NW 走无驱队列可以正常出纸，所以在 Docker 部署里
+默认选无驱，只有在设备明确不支持时才回退到 PPD。
+
+到 **成员与权限 → 服务器打印驱动** 可以查看已建队列、实际使用的驱动，以及服务器上
+所有 PPD。队列名、驱动名和最近错误都在那里，出纸异常时先看这一页。
+
+只复制 PPD 不复制过滤器是常见错误：`lp` 会收下任务，但打印机收不到可解析的数据，
+表现为“提交成功、不出纸”。
 
 ## 配置项
 
@@ -119,6 +136,7 @@ docker compose up -d --build
 | `CLOUDPRINT_PUBLIC_URL` | 空 | 外部访问地址，用于代理下载链接 |
 | `CLOUDPRINT_ADMIN_USER` | `admin` | 初始管理员用户名 |
 | `CLOUDPRINT_ADMIN_PASSWORD` | 随机 | 初始管理员密码，仅首次建库生效 |
+| `CLOUDPRINT_ANONYMOUS` | `false` | 设为 `true` 后免登录，所有请求按管理员处理；仅限可信局域网 |
 | `CLOUDPRINT_SESSION_HOURS` | `12` | 会话有效期 |
 | `CLOUDPRINT_DAILY_QUOTA` | `50` | 新用户默认每日页数，0 为不限 |
 | `CLOUDPRINT_MAX_UPLOAD_MB` | `50` | 单文件上限 |
@@ -126,8 +144,9 @@ docker compose up -d --build
 | `CLOUDPRINT_ENABLE_MDNS` | `true` | 是否启用 mDNS 发现 |
 | `CLOUDPRINT_SCAN_CIDRS` | 空 | 额外扫描网段，逗号分隔；留空则自动使用本机网卡所在网段 |
 | `CLOUDPRINT_ALLOW_PRIVATE_SCAN` | `true` | 是否允许网段扫描 |
-| `CLOUDPRINT_LIBREOFFICE` | 自动查找 | `soffice` 路径 |
 | `CLOUDPRINT_PDFTOPPM` | 自动查找 | `pdftoppm` 路径 |
+| `CLOUDPRINT_CUPS_HOST` | `127.0.0.1:631` | 本机 CUPS 地址 |
+| `CLOUDPRINT_PPD_DIRS` | 常见 CUPS 目录 | 额外 PPD 搜索目录，`:` 分隔 |
 | `CLOUDPRINT_COOKIE_SECURE` | `false` | HTTPS 部署时设为 true |
 | `CLOUDPRINT_TRUST_PROXY_HEADERS` | `false` | 仅可信反向代理后开启 |
 
@@ -152,7 +171,7 @@ go test ./internal/ipp
 - `GET/POST /api/admin/groups`、`PUT /api/admin/groups/{id}/members|printers`
 - `GET/POST /api/admin/printers`、`POST /api/admin/printers/{id}/endpoints`
 - `POST /api/admin/discover`、`POST /api/admin/candidates/{id}/approve`
-- `POST /api/agent/heartbeat|claim`、`POST /api/agent/jobs/{id}/start|result`
+- `GET /api/admin/cups/queues|drivers`、`POST /api/admin/cups/connect`、`DELETE /api/admin/cups/queues/{name}`
 
 所有修改类浏览器请求都需要 `X-CSRF-Token`（登录/`/api/auth/me` 返回）。
 
@@ -162,3 +181,4 @@ go test ./internal/ipp
 - 前端构建产物输出到 `backend/cmd/cloudprint/ui`，随后编译进单一二进制。
 - 数据表由 `backend/internal/database/migrations` 内嵌迁移自动创建。
 - 不要把真实打印机 IP 写进代码或默认配置。
+- CUPS 只在容器内监听 `127.0.0.1:631`，不要把它暴露到局域网。

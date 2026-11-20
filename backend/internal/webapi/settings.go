@@ -16,7 +16,6 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		"max_upload_mb":  s.Cfg.MaxUploadMB,
 		"enable_mdns":    s.Cfg.EnableMDNS,
 		"scan_cidrs":     s.Cfg.ScanCIDRs,
-		"libreoffice":    s.Pipeline.LibreOffice != "",
 		"pdf_preview":    s.Pipeline.PDFToPPM != "",
 		"retention_days": s.Cfg.RetentionDays,
 		"daily_quota":    s.Cfg.DefaultDailyQuota,
@@ -120,9 +119,33 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.Store.Audit(r.Context(), currentUser(r).ID, "update_user", "user", id, in)
+	// Audit which fields changed, never their values: the payload contains a
+	// password and would otherwise be stored in plain text.
+	s.Store.Audit(r.Context(), currentUser(r).ID, "update_user", "user", id, map[string]any{
+		"changed": changedUserFields(in.DisplayName, in.Role, in.Quota, in.IsActive, in.Password),
+	})
 	u, _ := s.Store.GetUser(r.Context(), id)
 	writeJSON(w, http.StatusOK, u)
+}
+
+func changedUserFields(displayName, role *string, quota *int, active *bool, password string) []string {
+	var out []string
+	if displayName != nil {
+		out = append(out, "display_name")
+	}
+	if role != nil {
+		out = append(out, "role")
+	}
+	if quota != nil {
+		out = append(out, "daily_page_quota")
+	}
+	if active != nil {
+		out = append(out, "is_active")
+	}
+	if password != "" {
+		out = append(out, "password")
+	}
+	return out
 }
 
 func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {

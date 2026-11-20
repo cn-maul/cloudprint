@@ -9,12 +9,14 @@ import (
 	"strings"
 	"time"
 
+	"cloudprint/internal/cups"
 	"cloudprint/internal/ipp"
 	"cloudprint/internal/store"
 )
 
 type Service struct {
 	Store *store.Store
+	CUPS  *cups.Client
 }
 
 type ProbeResult struct {
@@ -28,124 +30,131 @@ func (s *Service) Probe(ctx context.Context, ep *store.Endpoint) (res ProbeResul
 	start := time.Now()
 	res = ProbeResult{Health: "down"}
 	defer func() { res.DurationMS = time.Since(start).Milliseconds() }()
-	reachable := false
 	switch ep.Kind {
 	case "ipp":
-		reachable = tcpReachable(ctx, ep.URI, "631", 5*time.Second)
+		reachable := tcpReachable(ctx, ep.URI, "631", 5*time.Second)
 		if !reachable {
 			res.Error = "打印机现在连不上网络，请检查它是否开机、网线或 Wi-Fi 是否正常"
 			s.Store.RecordEndpointEvent(ctx, ep.ID, "probe_fail", map[string]any{"error": res.Error})
 			return res
 		}
-		client, err := ipp.NewClient(ep.URI, 15*time.Second)
-		if err != nil {
-			res.Error = err.Error()
-			s.Store.RecordEndpointEvent(ctx, ep.ID, "probe_fail", map[string]any{"error": res.Error})
-			return res
-		}
-		msg, err := client.GetPrinterAttributes(ctx, []string{
-			"printer-make-and-model",
-			"document-format-supported",
-			"document-format-default",
-			"sides-supported",
-			"media-supported",
-			"media-default",
-			"copies-supported",
-			"copies-default",
-			"print-color-mode-supported",
-			"printer-state",
-			"printer-state-reasons",
-			"printer-is-accepting-jobs",
-		})
-		if err != nil {
-			res.Error = err.Error()
-			s.Store.RecordEndpointEvent(ctx, ep.ID, "probe_fail", map[string]any{"error": res.Error})
-			return res
-		}
-		caps := extractCaps(msg)
-		res.Capabilities = caps
-		res.Health = "healthy"
-		if !caps.SupportsPDF() {
-			res.Health = "degraded"
-			res.Error = "这台打印机不能直接接收网页上传的文件，需要 Windows 电脑上的驱动帮忙"
-		}
-		if caps.State == "stopped" {
-			res.Health = "degraded"
-			res.Error = "打印机处于暂停状态，请在打印机面板上恢复"
-		}
-		_ = s.Store.UpdateEndpointHealth(ctx, ep.ID, res.Health, caps, res.Error)
-		s.Store.RecordEndpointEvent(ctx, ep.ID, "probe_ok", map[string]any{
-			"health": res.Health,
-			"caps":   caps,
-			"ms":     time.Since(start).Milliseconds(),
-		})
-	case "socket":
-		reachable = tcpReachable(ctx, ep.URI, "9100", 5*time.Second)
-		if reachable {
-			res.Health = "degraded"
-			res.Capabilities = store.Capabilities{
-				DocumentFormats: []string{"application/octet-stream"},
-				CheckedAt:       store.Now(),
-			}
-			res.Error = "这台打印机需要 Windows 电脑上的驱动转发"
-		} else {
-			res.Error = "打印机现在连不上网络，请检查它是否开机"
-		}
-		_ = s.Store.UpdateEndpointHealth(ctx, ep.ID, res.Health, res.Capabilities, res.Error)
-	case "agent":
-		reachable = agentReachable(ctx, s.Store, ep.AgentID)
-		if reachable {
-			res.Health = "healthy"
-			res.Capabilities = store.Capabilities{
-				DocumentFormats: []string{"application/pdf"},
-				CheckedAt:       store.Now(),
-			}
-			res.Capabilities.Sides = []string{"one-sided", "two-sided-long-edge", "two-sided-short-edge"}
-			res.Capabilities.Media = []string{"A4"}
-			res.Capabilities.MaxCopies = 99
-		} else {
-			res.Error = "帮忙转发的 Windows 电脑现在不在线"
-		}
-		_ = s.Store.UpdateEndpointHealth(ctx, ep.ID, res.Health, res.Capabilities, res.Error)
+		s.probeIPP(ctx, ep, &res)
+	case "cups":
+		s.probeCUPS(ctx, ep, &res)
 	default:
 		res.Error = "无法识别这台打印机的连接方式"
 	}
 	return res
 }
 
-func agentReachable(ctx context.Context, st *store.Store, agentID string) bool {
-	if strings.TrimSpace(agentID) == "" {
-		return false
-	}
-	a, err := st.GetAgent(ctx, agentID)
+func (s *Service) probeIPP(ctx context.Context, ep *store.Endpoint, res *ProbeResult) {
+	client, err := ipp.NewClient(ep.URI, 15*time.Second)
 	if err != nil {
-		return false
-	}
-	return a.Online && a.IsActive
-}
-
-// RefreshAgentEndpoints recalculates health for every endpoint backed by an
-// agent. Agent liveness changes between the 5-minute full probes, and a stale
-// "down" makes the print page grey out a printer that just came back online.
-func (s *Service) RefreshAgentEndpoints(ctx context.Context) {
-	printers, err := s.Store.ListPrinters(ctx, true)
-	if err != nil {
+		res.Error = err.Error()
+		s.Store.RecordEndpointEvent(ctx, ep.ID, "probe_fail", map[string]any{"error": res.Error})
 		return
 	}
-	for _, p := range printers {
-		for i := range p.Endpoints {
-			ep := p.Endpoints[i]
-			if ep.Kind != "agent" || !ep.IsEnabled {
-				continue
+	msg, err := client.GetPrinterAttributes(ctx, []string{
+		"printer-make-and-model",
+		"document-format-supported",
+		"document-format-default",
+		"sides-supported",
+		"media-supported",
+		"media-default",
+		"copies-supported",
+		"copies-default",
+		"print-color-mode-supported",
+		"printer-state",
+		"printer-state-reasons",
+		"printer-is-accepting-jobs",
+	})
+	if err != nil {
+		res.Error = err.Error()
+		s.Store.RecordEndpointEvent(ctx, ep.ID, "probe_fail", map[string]any{"error": res.Error})
+		return
+	}
+	caps := extractCaps(msg)
+	res.Capabilities = caps
+	res.Health = "healthy"
+	if !caps.SupportsPDF() {
+		// The device speaks IPP but only a raster/PCL dialect. Linux can still
+		// print to it, but only through a CUPS queue with a vendor PPD, so the
+		// endpoint itself must not be scheduled.
+		res.Health = "degraded"
+		res.Error = "这台打印机不直接接收 PDF，请在服务器上装好驱动后用 CUPS 队列接入"
+	}
+	if caps.State == "stopped" {
+		res.Health = "degraded"
+		res.Error = "打印机处于暂停状态，请在打印机面板上恢复"
+	}
+	_ = s.Store.UpdateEndpointHealth(ctx, ep.ID, res.Health, caps, res.Error)
+	s.Store.RecordEndpointEvent(ctx, ep.ID, "probe_ok", map[string]any{
+		"health": res.Health,
+		"caps":   caps,
+		"ms":     res.DurationMS,
+	})
+}
+
+// probeCUPS asks the spooler, not the device, whether the queue can print.
+// CUPS already knows the driver and reports a stopped queue when the device is
+// unreachable, which is the same condition that would swallow a job.
+func (s *Service) probeCUPS(ctx context.Context, ep *store.Endpoint, res *ProbeResult) {
+	if s.CUPS == nil {
+		res.Error = "CUPS 未初始化"
+		return
+	}
+	q, err := s.CUPS.Queue(ctx, ep.QueueName)
+	if err != nil {
+		res.Error = "CUPS 队列不可用：" + err.Error()
+		_ = s.Store.UpdateEndpointHealth(ctx, ep.ID, "down", store.Capabilities{}, res.Error)
+		return
+	}
+	caps := store.Capabilities{
+		DocumentFormats: []string{"application/pdf"},
+		MakeModel:       q.MakeModel,
+		State:           q.State,
+		Media:           []string{"A4", "A3", "Letter", "Legal"},
+		MaxCopies:       99,
+		CheckedAt:       store.Now(),
+	}
+	// The queue's PPD is not consulted: rendering happens before the document
+	// reaches CUPS. Ask the device what resolution it wants instead.
+	if uri, uerr := s.CUPS.DeviceURI(ctx, ep.QueueName); uerr == nil && uri != "" {
+		if client, cerr := ipp.NewClient(uri, 8*time.Second); cerr == nil {
+			if msg, merr := client.GetPrinterAttributes(ctx, []string{
+				"printer-resolution-default", "document-format-supported",
+			}); merr == nil {
+				if v, ok := msg.Resolution(ipp.TagPrinterAttributes, "printer-resolution-default"); ok {
+					caps.Resolution = v
+				}
+				caps.DocumentFormats = msg.Strings(ipp.TagPrinterAttributes, "document-format-supported")
 			}
-			aa, err := s.Store.GetAgent(ctx, ep.AgentID)
-			online := err == nil && aa.Online && aa.IsActive
-			if online == (ep.Health == "healthy") {
-				continue
-			}
-			_ = s.Probe(ctx, &ep)
 		}
 	}
+	res.Capabilities = caps
+	switch {
+	case !q.Enabled:
+		res.Health = "down"
+		res.Error = "CUPS 队列已停用，请到 CUPS 里启用它"
+	case q.State == "stopped":
+		res.Health = "down"
+		res.Error = firstNonEmpty(q.Message, "打印机已暂停，CUPS 无法出纸")
+	default:
+		res.Health = "healthy"
+	}
+	_ = s.Store.UpdateEndpointHealth(ctx, ep.ID, res.Health, caps, res.Error)
+	s.Store.RecordEndpointEvent(ctx, ep.ID, "probe_ok", map[string]any{
+		"health": res.Health, "queue": q.Name, "driver": q.MakeModel,
+	})
+}
+
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
 }
 
 func tcpReachable(ctx context.Context, rawURI, defPort string, timeout time.Duration) bool {
@@ -169,7 +178,6 @@ func tcpTarget(rawURI, defPort string) (string, string, error) {
 	}
 	host := u.Hostname()
 	if host == "" {
-		// agent URIs are server-side identifiers, not socket targets.
 		return "", "", fmt.Errorf("缺少主机")
 	}
 	port := u.Port()
@@ -244,7 +252,7 @@ func (s *Service) ProbeAll(ctx context.Context) []ProbeResult {
 }
 
 // SelectEndpoint picks the best healthy endpoint capable of the job parameters.
-func SelectEndpoint(printer *store.Printer, duplex string, preferAgent bool) *store.Endpoint {
+func SelectEndpoint(printer *store.Printer, duplex string) *store.Endpoint {
 	if printer == nil {
 		return nil
 	}
@@ -253,10 +261,10 @@ func SelectEndpoint(printer *store.Printer, duplex string, preferAgent bool) *st
 		if !ep.IsEnabled || ep.Health != "healthy" {
 			continue
 		}
-		if ep.Kind == "socket" {
+		if ep.Kind == "ipp" && !ep.Capabilities.SupportsPDF() {
 			continue
 		}
-		if ep.Kind == "ipp" && !ep.Capabilities.SupportsPDF() {
+		if ep.Kind != "ipp" && ep.Kind != "cups" {
 			continue
 		}
 		if !supportsDuplex(ep.Capabilities, duplex) {
@@ -265,12 +273,6 @@ func SelectEndpoint(printer *store.Printer, duplex string, preferAgent bool) *st
 		candidates = append(candidates, ep)
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
-		if preferAgent {
-			ai, aj := candidates[i].Kind == "agent", candidates[j].Kind == "agent"
-			if ai != aj {
-				return ai
-			}
-		}
 		if candidates[i].Priority != candidates[j].Priority {
 			return candidates[i].Priority < candidates[j].Priority
 		}

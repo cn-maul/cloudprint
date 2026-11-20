@@ -19,8 +19,10 @@ type NewJob struct {
 	Duplex    string `json:"duplex"`
 	ColorMode string `json:"color_mode"`
 	PaperSize string `json:"paper_size"`
+	PageRange string `json:"page_range"`
 	RetryOf   string `json:"-"`
 	PDFFileID string `json:"-"`
+	Pages     int    `json:"-"`
 }
 
 func (s *Store) PagesToday(ctx context.Context, userID string) (int, error) {
@@ -80,6 +82,12 @@ func (s *Store) CreateJob(ctx context.Context, in NewJob) (*Job, error) {
 	if in.PaperSize == "" {
 		in.PaperSize = "A4"
 	}
+	if in.Pages < 0 || in.Pages > file.PageCount {
+		return nil, fmt.Errorf("页码超出文件范围")
+	}
+	if in.Pages == 0 {
+		in.Pages = file.PageCount
+	}
 	if in.ColorMode == "" {
 		in.ColorMode = "monochrome"
 	}
@@ -100,8 +108,9 @@ func (s *Store) CreateJob(ctx context.Context, in NewJob) (*Job, error) {
 		Duplex:       in.Duplex,
 		ColorMode:    in.ColorMode,
 		PaperSize:    in.PaperSize,
-		PageCount:    file.PageCount,
-		TotalPages:   file.PageCount * in.Copies,
+		PageCount:    in.Pages,
+		TotalPages:   in.Pages * in.Copies,
+		PageRange:    in.PageRange,
 		RetryOf:      in.RetryOf,
 		CreatedAt:    now,
 		UpdatedAt:    now,
@@ -111,11 +120,13 @@ func (s *Store) CreateJob(ctx context.Context, in NewJob) (*Job, error) {
 		retry = j.RetryOf
 	}
 	_, err = s.DB.ExecContext(ctx, `INSERT INTO print_jobs
-		(id, user_id, printer_id, original_file_id, pdf_file_id, status, copies, duplex,
-		color_mode, paper_size, page_count, retry_of, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)`,
-		j.ID, j.UserID, j.PrinterID, j.OriginalFile, j.PDFFile, j.Copies, j.Duplex,
-		j.ColorMode, j.PaperSize, j.PageCount, retry, j.CreatedAt, j.UpdatedAt)
+		(id, user_id, printer_id, printer_name, original_file_id, pdf_file_id,
+		status, copies, duplex, color_mode, paper_size, page_count, page_range, retry_of,
+		created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		j.ID, j.UserID, j.PrinterID, j.PrinterName, j.OriginalFile, j.PDFFile,
+		j.Copies, j.Duplex, j.ColorMode, j.PaperSize, j.PageCount, j.PageRange, retry,
+		j.CreatedAt, j.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -123,13 +134,15 @@ func (s *Store) CreateJob(ctx context.Context, in NewJob) (*Job, error) {
 }
 
 const jobSelect = `SELECT j.id, j.user_id, COALESCE(u.display_name, u.username, '') AS username,
-	j.printer_id, COALESCE(p.display_name, '') AS printer_name, COALESCE(j.endpoint_id, ''),
-	COALESCE(e.uri, ''), COALESCE(j.agent_id, ''), COALESCE(j.original_file_id, ''),
+	COALESCE(j.printer_id, ''),
+	COALESCE(NULLIF(p.display_name, ''), j.printer_name, '') AS printer_name,
+	COALESCE(j.endpoint_id, ''),
+	COALESCE(e.uri, ''), COALESCE(j.original_file_id, ''),
 	COALESCE(j.pdf_file_id, ''), COALESCE(f.original_name, ''), j.status, j.copies, j.duplex,
 	j.color_mode, j.paper_size, j.page_count, j.error_code, j.error_message,
 	COALESCE(j.retry_of, ''), j.created_at, j.updated_at, COALESCE(j.claimed_at, ''),
 	COALESCE(j.lease_expires_at, ''), COALESCE(j.started_at, ''), COALESCE(j.finished_at, ''),
-	COALESCE(e.queue_name, '')
+	COALESCE(e.queue_name, ''), COALESCE(j.cups_job_id, ''), COALESCE(j.page_range, '')
 	FROM print_jobs j
 	LEFT JOIN users u ON u.id = j.user_id
 	LEFT JOIN printers p ON p.id = j.printer_id
@@ -139,11 +152,11 @@ const jobSelect = `SELECT j.id, j.user_id, COALESCE(u.display_name, u.username, 
 func scanJob(row rowScanner) (Job, error) {
 	var j Job
 	err := row.Scan(&j.ID, &j.UserID, &j.Username, &j.PrinterID, &j.PrinterName,
-		&j.EndpointID, &j.EndpointURI, &j.AgentID, &j.OriginalFile, &j.PDFFile,
+		&j.EndpointID, &j.EndpointURI, &j.OriginalFile, &j.PDFFile,
 		&j.FileName, &j.Status, &j.Copies, &j.Duplex, &j.ColorMode, &j.PaperSize,
 		&j.PageCount, &j.ErrorCode, &j.ErrorMessage, &j.RetryOf, &j.CreatedAt,
 		&j.UpdatedAt, &j.ClaimedAt, &j.LeaseExpires, &j.StartedAt, &j.FinishedAt,
-		&j.QueueName)
+		&j.QueueName, &j.CUPSJobID, &j.PageRange)
 	j.TotalPages = j.PageCount * j.Copies
 	return j, err
 }
@@ -166,6 +179,10 @@ func (s *Store) ListJobs(ctx context.Context, f JobFilter) ([]Job, int, error) {
 	if f.UserID != "" {
 		where = append(where, "j.user_id = ?")
 		args = append(args, f.UserID)
+	}
+	if f.PrinterID != "" {
+		where = append(where, "j.printer_id = ?")
+		args = append(args, f.PrinterID)
 	}
 	if len(f.Statuses) > 0 {
 		ph := make([]string, len(f.Statuses))
@@ -221,7 +238,7 @@ func (s *Store) CancelJob(ctx context.Context, id, userID string, isAdmin bool) 
 
 // ClaimJob atomically reserves the next queued job for an endpoint, enforcing
 // one active job per logical printer.
-func (s *Store) ClaimJob(ctx context.Context, printerID, endpointID, agentID string, lease time.Duration) (*Job, error) {
+func (s *Store) ClaimJob(ctx context.Context, printerID, endpointID string, lease time.Duration) (*Job, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -248,9 +265,9 @@ func (s *Store) ClaimJob(ctx context.Context, printerID, endpointID, agentID str
 	now := time.Now().UTC()
 	leaseExp := now.Add(lease).Format(time.RFC3339)
 	res, err := tx.ExecContext(ctx, `UPDATE print_jobs SET status = 'claimed', endpoint_id = ?,
-		agent_id = NULLIF(?, ''), claimed_at = ?, lease_expires_at = ?, updated_at = ?
+		claimed_at = ?, lease_expires_at = ?, updated_at = ?
 		WHERE id = ? AND status = 'queued'`,
-		endpointID, agentID, now.Format(time.RFC3339), leaseExp, now.Format(time.RFC3339), id)
+		endpointID, now.Format(time.RFC3339), leaseExp, now.Format(time.RFC3339), id)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +297,7 @@ func (s *Store) MarkPrinting(ctx context.Context, id, endpointID string) error {
 
 func (s *Store) ReleaseClaim(ctx context.Context, id string) error {
 	_, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = 'queued',
-		endpoint_id = NULL, agent_id = NULL, claimed_at = NULL, lease_expires_at = NULL,
+		endpoint_id = NULL, claimed_at = NULL, lease_expires_at = NULL,
 		updated_at = ? WHERE id = ? AND status = 'claimed'`, Now(), id)
 	return err
 }
@@ -305,15 +322,119 @@ func (s *Store) CompleteJob(ctx context.Context, id, endpointID string, ok bool,
 }
 
 func (s *Store) RequeueExpiredClaims(ctx context.Context) (int, error) {
-	res, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = 'queued',
-		endpoint_id = NULL, agent_id = NULL, claimed_at = NULL, lease_expires_at = NULL,
+	// A local CUPS submit is synchronous, so a row stuck in "printing" means
+	// the process died mid-submit. Its CUPS job id is unknown or unusable;
+	// fail it instead of silently reprinting a document the user already got.
+	res, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = 'failed',
+		error_code = 'SUBMIT_TIMEOUT',
+		error_message = '提交打印超时，请确认纸张是否已出；如未出纸请重新提交',
+		finished_at = ?, updated_at = ?
+		WHERE status = 'printing' AND started_at IS NOT NULL
+		AND started_at < ? AND COALESCE(cups_job_id, '') = ''`,
+		Now(), Now(), time.Now().UTC().Add(-10*time.Minute).Format(time.RFC3339))
+	if err != nil {
+		return 0, err
+	}
+	stale, _ := res.RowsAffected()
+	res, err = s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = 'queued',
+		endpoint_id = NULL, claimed_at = NULL, lease_expires_at = NULL,
 		updated_at = ? WHERE status = 'claimed' AND lease_expires_at < ?`,
 		Now(), Now())
 	if err != nil {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
+	return int(n) + int(stale), nil
+}
+
+// SetJobCUPSID links a print job to the spooler job so its state can be
+// polled after submission.
+func (s *Store) SetJobCUPSID(ctx context.Context, id, cupsJob string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET cups_job_id = ?,
+		updated_at = ? WHERE id = ?`, cupsJob, Now(), id)
+	return err
+}
+
+// PrintingCUPSJobs lists jobs submitted to a CUPS queue whose paper has not
+// been confirmed yet. A job is only "completed" once the device no longer
+// holds it, so the UI never claims success for a document that is still in
+// the queue or was aborted.
+//
+// Jobs without a stored device reference are included on purpose: a device
+// that omits job-uri from its Print-Job reply leaves exactly that state, and
+// excluding them would strand the job in "printing" forever.
+func (s *Store) PrintingCUPSJobs(ctx context.Context, limit int) ([]Job, error) {
+	rows, err := s.DB.QueryContext(ctx, jobSelect+` WHERE j.status = 'printing'
+		ORDER BY j.created_at LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Job{}
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// FailJob marks a job that was already accepted by an endpoint as failed.
+func (s *Store) FailJob(ctx context.Context, id, code, message string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = 'failed',
+		error_code = ?, error_message = ?, finished_at = ?, updated_at = ?
+		WHERE id = ? AND status = 'printing'`,
+		code, truncate(message, 1000), Now(), Now(), id)
+	return err
+}
+
+// SetJobNote attaches a transient explanation to an in-flight job without
+// changing its status. Used when the device reports a recoverable problem,
+// e.g. media-empty, while the spooler still holds the job.
+func (s *Store) SetJobNote(ctx context.Context, id, code, message string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET error_code = ?,
+		error_message = ?, updated_at = ? WHERE id = ? AND status = 'printing'`,
+		code, truncate(message, 1000), Now(), id)
+	return err
+}
+
+// ClearJobNote removes a transient explanation once the condition it described
+// is gone, so a job that recovered does not keep showing "out of paper".
+func (s *Store) ClearJobNote(ctx context.Context, id string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET error_code = NULL,
+		error_message = '', updated_at = ? WHERE id = ? AND status = 'printing'`,
+		Now(), id)
+	return err
+}
+
+// ClearFinishedJobs removes a printer's finished job history and returns how
+// many rows went away.
+//
+// Only terminal jobs are eligible. 'queued' and 'claimed' are still waiting to
+// print, and 'printing' is in flight on the device, so deleting any of those
+// would erase work the user still expects. That includes the stuck 'printing'
+// rows: those are deliberately left to the stall watchdog, which fails them
+// with an explanation rather than silently dropping them.
+func (s *Store) ClearFinishedJobs(ctx context.Context, printerID string) (int, error) {
+	res, err := s.DB.ExecContext(ctx, `DELETE FROM print_jobs
+		WHERE printer_id = ?
+		  AND status IN ('completed','failed','canceled')`, printerID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
 	return int(n), nil
+}
+
+// CancelSubmittedJob marks a job canceled after its spooler job was canceled.
+func (s *Store) CancelSubmittedJob(ctx context.Context, id, code, message string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = 'canceled',
+		error_code = ?, error_message = ?, finished_at = ?, updated_at = ?
+		WHERE id = ? AND status IN ('claimed','printing')`,
+		code, truncate(message, 1000), Now(), Now(), id)
+	return err
 }
 
 func (s *Store) HasActiveJob(ctx context.Context, printerID string) (bool, error) {
@@ -326,11 +447,11 @@ func (s *Store) HasActiveJob(ctx context.Context, printerID string) (bool, error
 // ClaimQueuedJob atomically reserves one specific queued job for an endpoint.
 // The NOT EXISTS clause makes the one-active-job-per-printer rule part of the
 // same statement, so two dispatchers cannot start two jobs on one printer.
-func (s *Store) ClaimQueuedJob(ctx context.Context, jobID, endpointID, agentID string, lease time.Duration) (*Job, error) {
+func (s *Store) ClaimQueuedJob(ctx context.Context, jobID, endpointID string, lease time.Duration) (*Job, error) {
 	now := time.Now().UTC()
 	leaseExp := now.Add(lease).Format(time.RFC3339)
 	res, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = 'claimed',
-		endpoint_id = ?, agent_id = NULLIF(?, ''), claimed_at = ?, lease_expires_at = ?,
+		endpoint_id = ?, claimed_at = ?, lease_expires_at = ?,
 		updated_at = ?
 		WHERE id = ? AND status = 'queued'
 		AND NOT EXISTS (
@@ -338,7 +459,7 @@ func (s *Store) ClaimQueuedJob(ctx context.Context, jobID, endpointID, agentID s
 			WHERE active.printer_id = print_jobs.printer_id
 			AND active.status IN ('claimed','printing')
 		)`,
-		endpointID, agentID, now.Format(time.RFC3339), leaseExp,
+		endpointID, now.Format(time.RFC3339), leaseExp,
 		now.Format(time.RFC3339), jobID)
 	if err != nil {
 		return nil, err
@@ -396,15 +517,13 @@ func (s *Store) Dashboard(ctx context.Context, userID string) (Dashboard, error)
 		}
 		rows.Close()
 	}
-	agents, err := s.ListAgents(ctx)
-	if err == nil {
-		d.AgentsTotal = len(agents)
-		for _, a := range agents {
-			if a.Online {
-				d.AgentsOnline++
-			}
-		}
-	}
+	// Report configured CUPS queues and how many are healthy.
+	var cupsTotal, cupsReady int
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM printer_endpoints WHERE kind = 'cups' AND is_enabled = 1`).Scan(&cupsTotal)
+	_ = s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM printer_endpoints
+		WHERE kind = 'cups' AND is_enabled = 1 AND health_status = 'healthy'`).Scan(&cupsReady)
+	d.CUPSReady = cupsReady
+	d.CUPSTotal = cupsTotal
 	user, err := s.GetUser(ctx, userID)
 	if err == nil {
 		d.DailyPageQuota = user.DailyPageQuota

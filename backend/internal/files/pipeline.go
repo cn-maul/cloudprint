@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -26,33 +25,27 @@ const (
 	KindPDF     = "application/pdf"
 	KindJPEG    = "image/jpeg"
 	KindPNG     = "image/png"
-	KindDOCX    = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-	KindXLSX    = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-	KindPPTX    = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 	MaxPDFPages = 200
 )
 
+// Pipeline turns an upload into a PDF that can be rasterized and sent to a
+// printer. V1 accepts PDF, JPEG and PNG only: Office documents would need a
+// LibreOffice runtime plus CJK fonts in the image, which is a large and
+// fragile dependency for a single-printer tool.
 type Pipeline struct {
-	Root          string
-	LibreOffice   string
-	PDFToPPM      string
-	MaxPages      int
-	ConvertTimout time.Duration
+	Root     string
+	PDFToPPM string
+	MaxPages int
 }
 
-func NewPipeline(root, libreOffice, pdftoppm string) *Pipeline {
-	if strings.TrimSpace(libreOffice) == "" {
-		libreOffice = findExecutable("soffice", "libreoffice")
-	}
+func NewPipeline(root, pdftoppm string) *Pipeline {
 	if strings.TrimSpace(pdftoppm) == "" {
 		pdftoppm = findExecutable("pdftoppm", "pdftoppm")
 	}
 	return &Pipeline{
-		Root:          root,
-		LibreOffice:   libreOffice,
-		PDFToPPM:      pdftoppm,
-		MaxPages:      MaxPDFPages,
-		ConvertTimout: 120 * time.Second,
+		Root:     root,
+		PDFToPPM: pdftoppm,
+		MaxPages: MaxPDFPages,
 	}
 }
 
@@ -96,22 +89,13 @@ func (p *Pipeline) DetectMIME(name string, head []byte) (string, error) {
 		}
 		return KindPNG, nil
 	case ".docx":
-		if isZIP(head) {
-			return KindDOCX, nil
-		}
-		return "", fmt.Errorf("文件内容不是有效的 DOCX")
+		return "", fmt.Errorf("暂不支持 Word 文档，请先另存为 PDF 再上传")
 	case ".xlsx":
-		if isZIP(head) {
-			return KindXLSX, nil
-		}
-		return "", fmt.Errorf("文件内容不是有效的 XLSX")
+		return "", fmt.Errorf("暂不支持 Excel 表格，请先另存为 PDF 再上传")
 	case ".pptx":
-		if isZIP(head) {
-			return KindPPTX, nil
-		}
-		return "", fmt.Errorf("文件内容不是有效的 PPTX")
+		return "", fmt.Errorf("暂不支持 PowerPoint，请先另存为 PDF 再上传")
 	default:
-		return "", fmt.Errorf("不支持的文件类型，请上传 PDF、DOCX、XLSX、PPTX、JPG 或 PNG")
+		return "", fmt.Errorf("不支持的文件类型，请上传 PDF、JPG 或 PNG")
 	}
 }
 
@@ -184,22 +168,6 @@ func (p *Pipeline) Prepare(ctx context.Context, inputPath, originalName, mime st
 		st, _ := os.Stat(out)
 		hash, _ := fileSHA256(out)
 		return &Prepared{PDFPath: out, PageCount: 1, SHA256: hash, SizeBytes: st.Size(), MIME: KindPDF, Converted: true}, nil
-	case KindDOCX, KindXLSX, KindPPTX:
-		if p.LibreOffice == "" {
-			return nil, fmt.Errorf("服务器未安装 LibreOffice，暂时无法转换 %s；请上传 PDF 或图片，或让管理员配置 CLOUDPRINT_LIBREOFFICE",
-				strings.TrimPrefix(filepath.Ext(originalName), "."))
-		}
-		out, err := p.officeToPDF(ctx, inputPath, inputHash, originalName)
-		if err != nil {
-			return nil, err
-		}
-		pages, err := p.validatePDF(out)
-		if err != nil {
-			return nil, err
-		}
-		st, _ := os.Stat(out)
-		hash, _ := fileSHA256(out)
-		return &Prepared{PDFPath: out, PageCount: pages, SHA256: hash, SizeBytes: st.Size(), MIME: KindPDF, Converted: true}, nil
 	default:
 		return nil, fmt.Errorf("不支持的文档类型")
 	}
@@ -267,57 +235,6 @@ func (p *Pipeline) imageToPDF(input, hash, mime string) (string, error) {
 		return "", fmt.Errorf("图片为空")
 	}
 	return out, nil
-}
-
-func (p *Pipeline) officeToPDF(ctx context.Context, input, hash, originalName string) (string, error) {
-	tmp, err := os.MkdirTemp(filepath.Join(p.Root, "tmp"), "office-*")
-	if err != nil {
-		return "", err
-	}
-	defer os.RemoveAll(tmp)
-	source := filepath.Join(tmp, "source"+strings.ToLower(filepath.Ext(originalName)))
-	if err := copyFile(input, source); err != nil {
-		return "", err
-	}
-	timeout := p.ConvertTimout
-	if timeout <= 0 {
-		timeout = 120 * time.Second
-	}
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, p.LibreOffice,
-		"--headless", "--norestore", "--nolockcheck", "--nodefault",
-		"--convert-to", "pdf", "--outdir", tmp, source)
-	cmd.Env = append(os.Environ(), "HOME="+tmp, "TMPDIR="+tmp)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
-			return "", fmt.Errorf("Office 转换超时（%s）", timeout)
-		}
-		return "", fmt.Errorf("Office 转换失败: %s", strings.TrimSpace(string(out)))
-	}
-	entries, err := os.ReadDir(tmp)
-	if err != nil {
-		return "", err
-	}
-	var produced string
-	for _, e := range entries {
-		if strings.EqualFold(filepath.Ext(e.Name()), ".pdf") {
-			produced = filepath.Join(tmp, e.Name())
-			break
-		}
-	}
-	if produced == "" {
-		return "", fmt.Errorf("Office 转换没有生成 PDF")
-	}
-	outDir := filepath.Join(p.Root, "pdf")
-	if err := os.MkdirAll(outDir, 0o750); err != nil {
-		return "", err
-	}
-	final := filepath.Join(outDir, "conv-"+hash+".pdf")
-	if err := copyFile(produced, final); err != nil {
-		return "", err
-	}
-	return final, nil
 }
 
 func (p *Pipeline) Preview(ctx context.Context, pdfPath, fileID string) (string, error) {
@@ -393,6 +310,10 @@ func fileSHA256(path string) (string, error) {
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
+
+// HashFile exposes the same SHA-256 digest for callers outside the pipeline,
+// such as jobs that print a page subset written by ExtractPages.
+func HashFile(path string) (string, error) { return fileSHA256(path) }
 
 func detectType(head []byte) string {
 	if len(head) >= 5 && string(head[:5]) == "%PDF-" {

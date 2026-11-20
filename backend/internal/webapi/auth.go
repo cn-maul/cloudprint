@@ -57,7 +57,9 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	if se != nil {
 		csrf = se.CSRF
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"user": u, "csrf_token": csrf})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user": u, "csrf_token": csrf, "anonymous": s.Cfg.AnonymousMode,
+	})
 }
 
 func (s *Server) handleCSRF(w http.ResponseWriter, r *http.Request) {

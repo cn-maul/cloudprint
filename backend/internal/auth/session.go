@@ -18,6 +18,6 @@ func TokenHash(token string) string {
 }
 
 func HashToken(token string) string {
-	// Agent tokens are high-entropy random values; SHA-256 is sufficient here.
+	// Session tokens are high-entropy random values; SHA-256 is sufficient here.
 	return sha256Hex(token)
 }

@@ -68,7 +68,7 @@ func run(log *slog.Logger) error {
 		fmt.Printf("登录后请立即修改密码。\n")
 		fmt.Printf("========================================\n\n")
 	}
-	pipeline := files.NewPipeline(cfg.DataDir, cfg.LibreOffice, cfg.PDFToPPM)
+	pipeline := files.NewPipeline(cfg.DataDir, cfg.PDFToPPM)
 	ui, err := fs.Sub(uiFS, "ui")
 	if err != nil {
 		return err

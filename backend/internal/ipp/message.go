@@ -12,6 +12,8 @@ const Version11 = 0x0101
 
 const (
 	OpGetPrinterAttributes = 0x000B
+	OpGetJobs              = 0x000A
+	OpGetJobAttributes     = 0x0009
 	OpPrintJob             = 0x0002
 	OpValidateJob          = 0x0004
 )
@@ -126,6 +128,31 @@ func (m *Message) Int(groupTag byte, name string) (int64, bool) {
 	return 0, false
 }
 
+// Resolution reads a resolution value (cross-feed and feed direction DPI) and
+// returns the feed-direction resolution, which is what a raster is rendered
+// against.
+func (m *Message) Resolution(groupTag byte, name string) (int, bool) {
+	a := m.Attr(groupTag, name)
+	if a == nil || len(a.Values) == 0 {
+		return 0, false
+	}
+	v := a.Values[0]
+	// A resolution value is two int32s (cross-feed and feed direction) plus a
+	// one-byte unit: 3 = dots per inch, 4 = dots per centimetre. Ignoring the
+	// unit turns a 60 dpcm printer into "60 dpi", so read it.
+	if v.Tag != ValueResolution || len(v.Data) < 8 {
+		return 0, false
+	}
+	dpi := int(binary.BigEndian.Uint32(v.Data[4:8]))
+	if len(v.Data) >= 9 && v.Data[8] == 4 {
+		dpi = int(float64(dpi) * 2.54)
+	}
+	if dpi <= 0 {
+		return 0, false
+	}
+	return dpi, true
+}
+
 type StatusError struct {
 	Code    uint16
 	Message string
@@ -168,22 +195,28 @@ func StatusText(code uint16) string {
 
 func marshalValuePayload(tag byte, val Value) []byte {
 	var buf bytes.Buffer
-	if tag == ValueInteger || tag == ValueEnum {
+	var payload []byte
+	switch tag {
+	case ValueInteger, ValueEnum:
 		var tmp [4]byte
 		binary.BigEndian.PutUint32(tmp[:], uint32(val.Int))
-		buf.Write(tmp[:])
-	} else if tag == ValueBoolean {
+		payload = tmp[:]
+	case ValueBoolean:
 		if val.Bool {
-			buf.WriteByte(1)
+			payload = []byte{1}
 		} else {
-			buf.WriteByte(0)
+			payload = []byte{0}
 		}
-	} else {
-		var tmp [2]byte
-		binary.BigEndian.PutUint16(tmp[:], uint16(len(val.Data)))
-		buf.Write(tmp[:])
-		buf.Write(val.Data)
+	default:
+		payload = val.Data
 	}
+	// IPP encodes every value as a 2-byte length followed by that many bytes,
+	// including integers and booleans. Real devices depend on it; a payload
+	// without the prefix shifts every following attribute.
+	var tmp [2]byte
+	binary.BigEndian.PutUint16(tmp[:], uint16(len(payload)))
+	buf.Write(tmp[:])
+	buf.Write(payload)
 	return buf.Bytes()
 }
 
@@ -300,63 +333,94 @@ func parseValue(data []byte, pos int, tag byte) (Value, int, error) {
 	v := Value{Tag: tag}
 	switch tag {
 	case 0x10, 0x12, 0x13:
+		// Out-of-band values (unsupported, default, no-value) carry no data.
 		return v, pos, nil
 	case ValueInteger, ValueEnum:
-		if pos+4 > len(data) {
+		p, err := valuePayload(data, pos, 4)
+		if err != nil {
+			return v, pos, err
+		}
+		if len(p) != 4 {
 			return v, pos, errors.New("IPP 整数值越界")
 		}
-		v.Int = int32(binary.BigEndian.Uint32(data[pos : pos+4]))
-		return v, pos + 4, nil
+		v.Int = int32(binary.BigEndian.Uint32(p))
+		return v, pos + 2 + len(p), nil
 	case ValueBoolean:
-		if pos >= len(data) {
+		p, err := valuePayload(data, pos, 1)
+		if err != nil {
+			return v, pos, err
+		}
+		if len(p) != 1 {
 			return v, pos, errors.New("IPP 布尔值越界")
 		}
-		v.Bool = data[pos] != 0
-		return v, pos + 1, nil
-	case ValueRangeOfInteger, ValueResolution:
-		if pos+8 > len(data) {
+		v.Bool = p[0] != 0
+		return v, pos + 2 + len(p), nil
+	case ValueRangeOfInteger:
+		p, err := valuePayload(data, pos, 8)
+		if err != nil {
+			return v, pos, err
+		}
+		if len(p) != 8 {
 			return v, pos, errors.New("IPP 复合整数值越界")
 		}
-		v.Data = append([]byte(nil), data[pos:pos+8]...)
-		return v, pos + 8, nil
-	case ValueDateTime:
-		if pos+2 > len(data) {
-			return v, pos, errors.New("IPP 日期越界")
+		v.Data = append([]byte(nil), p...)
+		return v, pos + 2 + len(p), nil
+	case ValueResolution:
+		// Two int32s plus the unit byte; the length is 9 in practice, but a
+		// couple of devices omit the unit, so accept the shorter form too.
+		p, err := valuePayload(data, pos, 0)
+		if err != nil {
+			return v, pos, err
 		}
-		l := int(binary.BigEndian.Uint16(data[pos : pos+2]))
-		pos += 2
-		if pos+l > len(data) {
+		if len(p) != 8 && len(p) != 9 {
+			return v, pos, fmt.Errorf("IPP 分辨率值长度异常: %d", len(p))
+		}
+		v.Data = append([]byte(nil), p...)
+		return v, pos + 2 + len(p), nil
+	case ValueDateTime:
+		p, err := valuePayload(data, pos, 0)
+		if err != nil {
 			return v, pos, errors.New("IPP 日期值越界")
 		}
-		v.Data = append([]byte(nil), data[pos:pos+l]...)
-		return v, pos + l, nil
-	case ValueBegCollection:
-		return v, pos, nil
-	case ValueMemberName:
-		if pos+2 > len(data) {
-			return v, pos, errors.New("IPP 成员名越界")
+		v.Data = append([]byte(nil), p...)
+		return v, pos + 2 + len(p), nil
+	case ValueBegCollection, ValueEndCollection:
+		p, err := valuePayload(data, pos, 0)
+		if err != nil {
+			return v, pos, err
 		}
-		l := int(binary.BigEndian.Uint16(data[pos : pos+2]))
-		pos += 2
-		if pos+l > len(data) {
+		return v, pos + 2 + len(p), nil
+	case ValueMemberName:
+		p, err := valuePayload(data, pos, 0)
+		if err != nil {
 			return v, pos, errors.New("IPP 成员名值越界")
 		}
-		v.Data = append([]byte(nil), data[pos:pos+l]...)
-		return v, pos + l, nil
-	case ValueEndCollection:
-		return v, pos, nil
+		v.Data = append([]byte(nil), p...)
+		return v, pos + 2 + len(p), nil
 	default:
-		if pos+2 > len(data) {
+		p, err := valuePayload(data, pos, 0)
+		if err != nil {
 			return v, pos, errors.New("IPP 字符串长度缺失")
 		}
-		l := int(binary.BigEndian.Uint16(data[pos : pos+2]))
-		pos += 2
-		if pos+l > len(data) {
-			return v, pos, errors.New("IPP 字符串越界")
-		}
-		v.Data = append([]byte(nil), data[pos:pos+l]...)
-		return v, pos + l, nil
+		v.Data = append([]byte(nil), p...)
+		return v, pos + 2 + len(p), nil
 	}
+}
+
+// valuePayload reads the 2-byte length prefix at pos and returns that many
+// bytes. want > 0 rejects a prefix that does not match the type's fixed size.
+func valuePayload(data []byte, pos, want int) ([]byte, error) {
+	if pos+2 > len(data) {
+		return nil, errors.New("IPP 值长度缺失")
+	}
+	l := int(binary.BigEndian.Uint16(data[pos : pos+2]))
+	if want > 0 && l != want {
+		return nil, fmt.Errorf("IPP 值长度异常: 期望 %d，实际 %d", want, l)
+	}
+	if pos+2+l > len(data) {
+		return nil, errors.New("IPP 值越界")
+	}
+	return data[pos+2 : pos+2+l], nil
 }
 
 func (m *Message) SortedAttrNames(groupTag byte) []string {
