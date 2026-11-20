@@ -28,6 +28,14 @@ export function ChevronRightIcon({size = 20}: {size?: number}) {
   );
 }
 
+export function ChevronDownIcon({size = 20}: {size?: number}) {
+  return (
+    <svg fill="none" height={size} viewBox="0 0 24 24" width={size}>
+      <path d="m5 9 7 7 7-7" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.9" />
+    </svg>
+  );
+}
+
 export function UploadIcon({size = 24}: {size?: number}) {
   return (
     <svg fill="none" height={size} viewBox="0 0 24 24" width={size}>
@@ -220,6 +228,41 @@ export function RetryIcon({size = 18}: {size?: number}) {
         strokeLinejoin="round"
         strokeWidth="1.7"
       />
+    </svg>
+  );
+}
+
+export function SearchIcon({size = 18}: {size?: number}) {
+  return (
+    <svg fill="none" height={size} viewBox="0 0 24 24" width={size}>
+      <circle cx="11" cy="11" r="6.5" stroke="currentColor" strokeWidth="1.7" />
+      <path d="m16 16 4.5 4.5" stroke="currentColor" strokeLinecap="round" strokeWidth="1.9" />
+    </svg>
+  );
+}
+
+export function NetworkIcon({size = 18}: {size?: number}) {
+  return (
+    <svg fill="none" height={size} viewBox="0 0 24 24" width={size}>
+      <rect height="5" rx="1.2" stroke="currentColor" strokeWidth="1.7" width="6" x="9" y="3" />
+      <rect height="5" rx="1.2" stroke="currentColor" strokeWidth="1.7" width="6" x="2" y="16" />
+      <rect height="5" rx="1.2" stroke="currentColor" strokeWidth="1.7" width="6" x="16" y="16" />
+      <path
+        d="M12 8v4m0 0H5v4m7-4h7v4"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.7"
+      />
+    </svg>
+  );
+}
+
+export function PlusCircleIcon({size = 18}: {size?: number}) {
+  return (
+    <svg fill="none" height={size} viewBox="0 0 24 24" width={size}>
+      <circle cx="12" cy="12" r="8.5" stroke="currentColor" strokeWidth="1.7" />
+      <path d="M12 8.5v7M8.5 12h7" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
     </svg>
   );
 }

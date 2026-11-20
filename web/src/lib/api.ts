@@ -120,8 +120,18 @@ export type Candidate = {
   possible_ip_change: boolean;
   already_added?: boolean;
   printer_name?: string;
+  supported?: boolean;
+  unsupported_reason?: string;
   first_seen_at: string;
   last_seen_at: string;
+};
+
+export type SupportedModel = {
+  id: string;
+  name: string;
+  vendor?: string;
+  driver?: string;
+  notes?: string;
 };
 
 export type QuickAddResult = {
@@ -149,6 +159,12 @@ export type CUPSDriver = {
   name: string;
   manufacturer?: string;
   model?: string;
+};
+
+export type DriverList = {
+  available: boolean;
+  reason?: string;
+  drivers: CUPSDriver[];
 };
 
 export type CUPSStatus = {

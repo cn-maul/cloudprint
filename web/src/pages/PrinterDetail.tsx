@@ -14,7 +14,8 @@ import {notifyError, notifySuccess, notifyWarning} from "../lib/toast";
 import {
   AlertIcon,
   ArrowLeftIcon,
-  CheckIcon,
+  ArrowRightIcon,
+  ChevronDownIcon,
   ChevronRightIcon,
   CloseIcon,
   CopyIcon,
@@ -55,9 +56,11 @@ export default function PrinterDetailPage({
   const [filter, setFilter] = useState<FilterKey>("all");
   const [offset, setOffset] = useState(0);
   const [file, setFile] = useState<UploadResult | null>(null);
+  const [previewFailed, setPreviewFailed] = useState(false);
+  const [previewPage, setPreviewPage] = useState(1);
   const [pages, setPages] = useState("");
   const [copies, setCopies] = useState(1);
-  const [paper, setPaper] = useState("A4");
+  const [queueOpen, setQueueOpen] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [drag, setDrag] = useState(false);
@@ -81,13 +84,10 @@ export default function PrinterDetailPage({
     try {
       const r = await api<PrinterOptions>(`/api/printers/${printerId}/options`);
       setOptions(r);
-      if (r.paper_sizes?.length && !r.paper_sizes.includes(paper)) {
-        setPaper(r.paper_sizes.includes("A4") ? "A4" : r.paper_sizes[0]);
-      }
     } catch {
       setOptions(null);
     }
-  }, [printerId, paper]);
+  }, [printerId]);
 
   useEffect(() => {
     void load();
@@ -127,6 +127,8 @@ export default function PrinterDetailPage({
       form.append("file", f);
       const res = await api<UploadResult>("/api/files", {method: "POST", body: form});
       setFile(res);
+      setPreviewFailed(false);
+      setPreviewPage(1);
       setPages("");
     } catch (e) {
       setFile(null);
@@ -138,6 +140,8 @@ export default function PrinterDetailPage({
 
   function clearFile() {
     setFile(null);
+    setPreviewFailed(false);
+    setPreviewPage(1);
     setPages("");
     if (inputRef.current) inputRef.current.value = "";
   }
@@ -154,7 +158,7 @@ export default function PrinterDetailPage({
           copies,
           duplex: "one-sided",
           color_mode: "monochrome",
-          paper_size: paper,
+          paper_size: "A4",
           page_range: pages.trim(),
         }),
       });
@@ -238,7 +242,6 @@ export default function PrinterDetailPage({
   const offline = status.state === "stopped" || status.state === "unknown";
   const problem = isProblem(status.message);
   const finishedCount = jobs.filter((j) => FINISHED_STATUSES.includes(j.status)).length;
-  const paperSizes = options?.paper_sizes?.length ? options.paper_sizes : ["A4"];
   const activeJob = jobs.find((j) => j.status === "printing");
 
   return (
@@ -274,222 +277,294 @@ export default function PrinterDetailPage({
         </div>
       ) : null}
 
-      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <section className="overflow-hidden rounded-2xl border border-separator/60 bg-surface/60">
-          <header className="flex flex-wrap items-center gap-1.5 border-b border-separator/50 px-3 py-2.5">
-            <span className="mr-1 grid size-7 place-items-center text-muted">
-              <ListIcon size={15} />
+      <input
+        accept=".pdf,.jpg,.jpeg,.png"
+        className="hidden"
+        onChange={(e) => void upload(e.target.files?.[0])}
+        ref={inputRef}
+        type="file"
+      />
+
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_400px] lg:items-start">
+        <section
+          className={`flex min-h-[420px] flex-col overflow-hidden rounded-2xl border border-separator/60 bg-surface/60 lg:h-[calc(100vh-215px)] ${
+            drag ? "ring-2 ring-accent/50" : ""
+          }`}
+          onDragEnter={(e) => {
+            e.preventDefault();
+            setDrag(true);
+          }}
+          onDragLeave={() => setDrag(false)}
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDrag(false);
+            void upload(e.dataTransfer.files?.[0]);
+          }}
+          tabIndex={file ? 0 : -1}
+          onKeyDown={(e) => {
+            if (!file) return;
+            if (e.key === "ArrowLeft") {
+              e.preventDefault();
+              setPreviewPage((p) => Math.max(1, p - 1));
+            }
+            if (e.key === "ArrowRight") {
+              e.preventDefault();
+              setPreviewPage((p) => Math.min(file.page_count, p + 1));
+            }
+          }}
+        >
+          <header className="flex items-center gap-2 border-b border-separator/50 px-3 py-2">
+            <span className={`grid size-7 place-items-center ${file ? "text-accent" : "text-muted"}`}>
+              <FileIcon size={15} />
             </span>
-            {FILTERS.map((f) => (
-              <button
-                className={`rounded-lg px-2.5 py-1 text-xs transition ${
-                  filter === f.key
-                    ? "bg-accent/12 font-medium text-accent"
-                    : "text-muted hover:bg-default/50 hover:text-foreground"
-                }`}
-                key={f.key}
-                onClick={() => {
-                  setFilter(f.key);
-                  setOffset(0);
-                }}
-                type="button"
-              >
-                {f.label}
-              </button>
-            ))}
-            <span className="mono ml-auto text-[11px] text-muted">{total}</span>
-            {finishedCount > 0 ? (
-              <Button isIconOnly aria-label="清除已结束任务" size="sm" variant="ghost" onPress={() => void clearFinished()}>
-                <TrashIcon size={15} />
-              </Button>
+            <span className="min-w-0 flex-1 truncate text-xs">{file ? file.name : "未选择文件"}</span>
+            {file ? (
+              <>
+                <span className="mono shrink-0 rounded bg-default/50 px-1.5 py-0.5 text-[10px] text-muted">A4</span>
+                <Button isIconOnly aria-label="移除文件" size="sm" variant="ghost" onPress={clearFile}>
+                  <CloseIcon size={14} />
+                </Button>
+              </>
             ) : null}
           </header>
-          {jobs.length === 0 ? (
-            <div className="grid place-items-center py-20 text-muted/40">
-              <ListIcon size={26} />
-            </div>
-          ) : (
-            <ul className="divide-y divide-separator/50">
-              {jobs.map((j) => (
-                <JobRow
-                  key={j.id}
-                  job={j}
-                  onCancel={() => void cancel(j)}
-                  onReprint={() => void reprint(j)}
-                  onRetry={() => void retry(j)}
-                />
-              ))}
-            </ul>
-          )}
-          {total > PAGE_SIZE ? (
-            <div className="flex items-center justify-between border-t border-separator/50 px-3 py-2">
-              <Button
-                isDisabled={offset === 0}
-                size="sm"
-                variant="ghost"
-                onPress={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}
-              >
-                <ArrowLeftIcon size={15} />
-              </Button>
-              <span className="mono text-[11px] text-muted">
-                {offset + 1}–{Math.min(offset + jobs.length, total)} / {total}
-              </span>
-              <Button
-                isDisabled={offset + PAGE_SIZE >= total}
-                size="sm"
-                variant="ghost"
-                onPress={() => setOffset((o) => o + PAGE_SIZE)}
-              >
-                <ChevronRightIcon size={15} />
-              </Button>
-            </div>
-          ) : null}
-        </section>
 
-        <section className="space-y-4 self-start rounded-2xl border border-separator/60 bg-surface/60 p-4">
-          <input
-            accept=".pdf,.jpg,.jpeg,.png"
-            className="hidden"
-            onChange={(e) => void upload(e.target.files?.[0])}
-            ref={inputRef}
-            type="file"
-          />
-          <div
-            className={`relative flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed px-4 py-7 transition ${
-              drag ? "border-accent bg-accent/8" : "border-separator/80 hover:border-accent/50"
-            }`}
-            onClick={() => !uploading && inputRef.current?.click()}
-            onDragEnter={(e) => {
-              e.preventDefault();
-              setDrag(true);
-            }}
-            onDragLeave={() => setDrag(false)}
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => {
-              e.preventDefault();
-              setDrag(false);
-              void upload(e.dataTransfer.files?.[0]);
-            }}
-            role="button"
-            tabIndex={0}
-          >
+          <div className="relative min-h-0 flex-1 overflow-hidden bg-default/20">
             {uploading ? (
-              <Spinner size="sm" />
+              <div className="absolute inset-0 grid place-items-center">
+                <Spinner size="sm" />
+              </div>
+            ) : file && !previewFailed ? (
+              <div className="absolute inset-0 flex items-center justify-center p-5">
+                <img
+                  alt={`${file.name} 第 ${previewPage} 页`}
+                  className="max-h-full max-w-full rounded-[2px] bg-white object-contain shadow-[0_8px_24px_-10px_rgba(0,0,0,0.45)]"
+                  onError={() => setPreviewFailed(true)}
+                  src={`${file.preview_url}?page=${previewPage}`}
+                />
+              </div>
             ) : file ? (
-              <>
-                <span className="text-accent">
-                  <FileIcon size={24} />
-                </span>
-                <span className="max-w-full truncate px-6 text-sm font-medium">{file.name}</span>
-                <span className="mono text-[11px] text-muted">
-                  {file.page_count} 页 · {fmt.bytes(file.size_bytes)}
-                </span>
+              <div className="absolute inset-0 grid place-items-center text-muted">
+                <FileIcon size={30} />
+              </div>
+            ) : (
+              <div className="absolute inset-0 grid place-items-center p-6">
                 <button
-                  aria-label="移除文件"
-                  className="absolute top-2 right-2 grid size-7 place-items-center rounded-full text-muted transition hover:bg-default/60 hover:text-danger"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    clearFile();
-                  }}
+                  className={`flex w-full max-w-md flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed px-6 py-16 text-muted transition ${
+                    drag
+                      ? "border-accent text-accent"
+                      : "border-separator/80 hover:border-accent/50 hover:text-accent"
+                  }`}
+                  onClick={() => inputRef.current?.click()}
                   type="button"
                 >
-                  <CloseIcon size={14} />
+                  <UploadIcon size={30} />
+                  <span className="text-sm">选择文件</span>
                 </button>
-              </>
-            ) : (
-              <span className="text-muted">
-                <UploadIcon size={26} />
-              </span>
+              </div>
             )}
           </div>
 
-          {paperSizes.length > 1 ? (
-            <div className="flex items-center gap-1.5">
-              {paperSizes.map((p) => (
-                <button
-                  className={`flex-1 rounded-lg border px-2 py-1.5 text-xs transition ${
-                    paper === p
-                      ? "border-accent/60 bg-accent/10 font-medium text-accent"
-                      : "border-separator/70 text-muted hover:border-accent/40"
-                  }`}
-                  key={p}
-                  onClick={() => setPaper(p)}
-                  type="button"
-                >
-                  {p}
-                </button>
-              ))}
-            </div>
-          ) : null}
-
-          <div className="flex items-center gap-2">
-            <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-default/50 text-muted">
-              <ListIcon size={16} />
-            </span>
-            <Input
-              className="mono"
-              fullWidth
-              disabled={!file}
-              placeholder={file ? `1-${file.page_count}` : ""}
-              value={pages}
-              onChange={(e) => setPages(e.target.value)}
-            />
-            <span className="mono w-10 shrink-0 text-right text-xs text-muted">{file ? totalPages : 0}</span>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-default/50 text-muted">
-              <CopyIcon size={16} />
-            </span>
-            <Button isIconOnly size="sm" variant="secondary" onPress={() => setCopies((c) => Math.max(1, c - 1))}>
-              <MinusIcon size={15} />
-            </Button>
-            <div className="mono grid h-9 flex-1 place-items-center rounded-lg border border-separator bg-surface text-sm">
-              {copies}
-            </div>
-            <Button
-              isIconOnly
-              size="sm"
-              variant="secondary"
-              onPress={() => setCopies((c) => Math.min(copiesMax, c + 1))}
-            >
-              <PlusIcon size={15} />
-            </Button>
-          </div>
-
-          <div className="flex items-center justify-between border-t border-separator/60 pt-1 text-sm">
-            <span className="text-muted">
-              <CheckIcon size={15} />
-            </span>
-            <span className="mono text-xs text-muted">
-              {totalPages} × {copies} = <span className="text-foreground">{file ? totalPages * copies : 0}</span>
-            </span>
-          </div>
-
-          <Button fullWidth isDisabled={!file || submitting || offline} size="lg" onPress={() => void submit()}>
-            <PrinterIcon size={18} />
-            打印
-          </Button>
-
-          {activeJob?.progress ? (
-            <div className="space-y-1.5 border-t border-separator/60 pt-3">
-              <div className="flex items-center justify-between text-[11px] text-muted">
-                <span>正在打印</span>
-                <span className="mono">
-                  {activeJob.progress.printed}/{activeJob.progress.total}
-                </span>
-              </div>
-              <div className="h-1.5 overflow-hidden rounded-full bg-default/60">
-                <div
-                  className="h-full rounded-full bg-accent transition-all"
-                  style={{
-                    width: `${Math.min(100, Math.round((activeJob.progress.printed / Math.max(1, activeJob.progress.total)) * 100))}%`,
-                  }}
-                />
-              </div>
-            </div>
+          {file ? (
+            <footer className="flex shrink-0 items-center justify-center gap-1 border-t border-separator/50 bg-surface/60 py-1">
+              <Button
+                isIconOnly
+                aria-label="上一页"
+                isDisabled={previewPage <= 1}
+                size="sm"
+                variant="ghost"
+                onPress={() => setPreviewPage((p) => Math.max(1, p - 1))}
+              >
+                <ArrowLeftIcon size={15} />
+              </Button>
+              <span className="mono min-w-14 text-center text-[11px] text-muted">
+                {previewPage} / {file.page_count}
+              </span>
+              <Button
+                isIconOnly
+                aria-label="下一页"
+                isDisabled={previewPage >= file.page_count}
+                size="sm"
+                variant="ghost"
+                onPress={() => setPreviewPage((p) => Math.min(file.page_count, p + 1))}
+              >
+                <ChevronRightIcon size={15} />
+              </Button>
+            </footer>
           ) : null}
         </section>
+
+        <div className="flex min-w-0 flex-col gap-4 lg:h-[calc(100vh-215px)]">
+          <section
+            className={`overflow-hidden rounded-2xl border border-separator/60 bg-surface/60 ${
+              queueOpen ? "flex min-h-0 flex-col lg:flex-1" : "shrink-0"
+            }`}
+          >
+            {queueOpen ? (
+              <>
+              <header className="flex items-center gap-1.5 border-b border-separator/50 px-2 py-2.5">
+                {FILTERS.map((f) => (
+                  <button
+                    className={`rounded-lg px-1.5 py-1 text-xs transition ${
+                      filter === f.key
+                        ? "bg-accent/12 font-medium text-accent"
+                        : "text-muted hover:bg-default/50 hover:text-foreground"
+                    }`}
+                    key={f.key}
+                    onClick={() => {
+                      setFilter(f.key);
+                      setOffset(0);
+                    }}
+                    type="button"
+                  >
+                    {f.label}
+                  </button>
+                ))}
+                <span className="mono ml-auto text-[11px] text-muted">{total}</span>
+                {finishedCount > 0 ? (
+                  <Button
+                    isIconOnly
+                    aria-label="清除已结束任务"
+                    size="sm"
+                    variant="ghost"
+                    onPress={() => void clearFinished()}
+                  >
+                    <TrashIcon size={15} />
+                  </Button>
+                ) : null}
+                <Button
+                  isIconOnly
+                  aria-label="收起列表"
+                  size="sm"
+                  variant="ghost"
+                  onPress={() => setQueueOpen(false)}
+                >
+                  <ArrowRightIcon size={15} />
+                </Button>
+              </header>
+              <div className="max-h-[38vh] min-h-0 overflow-auto scroll-thin lg:max-h-none lg:flex-1">
+                {jobs.length === 0 ? (
+                  <div className="grid place-items-center py-16 text-muted/40">
+                    <ListIcon size={24} />
+                  </div>
+                ) : (
+                  <ul className="divide-y divide-separator/50">
+                    {jobs.map((j) => (
+                      <JobRow
+                        key={j.id}
+                        job={j}
+                        onCancel={() => void cancel(j)}
+                        onReprint={() => void reprint(j)}
+                        onRetry={() => void retry(j)}
+                      />
+                    ))}
+                  </ul>
+                )}
+              </div>
+              {total > PAGE_SIZE ? (
+                <div className="flex items-center justify-between border-t border-separator/50 px-3 py-2">
+                  <Button
+                    isDisabled={offset === 0}
+                    size="sm"
+                    variant="ghost"
+                    onPress={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}
+                  >
+                    <ArrowLeftIcon size={15} />
+                  </Button>
+                  <span className="mono text-[11px] text-muted">
+                    {offset + 1}–{Math.min(offset + jobs.length, total)} / {total}
+                  </span>
+                  <Button
+                    isDisabled={offset + PAGE_SIZE >= total}
+                    size="sm"
+                    variant="ghost"
+                    onPress={() => setOffset((o) => o + PAGE_SIZE)}
+                  >
+                    <ChevronRightIcon size={15} />
+                  </Button>
+                </div>
+              ) : null}
+              </>
+            ) : (
+              <button
+                aria-label="展开列表"
+                className="flex w-full items-center gap-2 px-3 py-2.5 text-muted transition hover:text-accent"
+                onClick={() => setQueueOpen(true)}
+                type="button"
+              >
+                <ListIcon size={15} />
+                <span className="text-xs">队列</span>
+                <span className="mono ml-auto text-[11px] tabular-nums">{total}</span>
+                {activeJob ? <span className="size-1.5 animate-pulse rounded-full bg-warning" /> : null}
+                <ChevronDownIcon size={15} />
+              </button>
+            )}
+          </section>
+
+          <section className="mt-auto shrink-0 space-y-3 rounded-2xl border border-separator/60 bg-surface/60 p-4">
+            <div className="flex items-center gap-2">
+              <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-default/50 text-muted">
+                <ListIcon size={16} />
+              </span>
+              <Input
+                className="mono"
+                fullWidth
+                disabled={!file}
+                placeholder={file ? `1-${file.page_count}` : ""}
+                value={pages}
+                onChange={(e) => setPages(e.target.value)}
+              />
+              <span className="mono w-10 shrink-0 text-right text-xs text-muted">{file ? totalPages : 0}</span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-default/50 text-muted">
+                <CopyIcon size={16} />
+              </span>
+              <Button isIconOnly size="sm" variant="secondary" onPress={() => setCopies((c) => Math.max(1, c - 1))}>
+                <MinusIcon size={15} />
+              </Button>
+              <div className="mono grid h-9 flex-1 place-items-center rounded-lg border border-separator bg-surface text-sm">
+                {copies}
+              </div>
+              <Button
+                isIconOnly
+                size="sm"
+                variant="secondary"
+                onPress={() => setCopies((c) => Math.min(copiesMax, c + 1))}
+              >
+                <PlusIcon size={15} />
+              </Button>
+              <span className="mono w-24 shrink-0 text-right text-xs text-muted">
+                {totalPages} × {copies} = <span className="text-foreground">{file ? totalPages * copies : 0}</span>
+              </span>
+            </div>
+
+            <Button fullWidth isDisabled={!file || submitting || offline} size="lg" onPress={() => void submit()}>
+              <PrinterIcon size={18} />
+              打印
+            </Button>
+
+            {activeJob?.progress ? (
+              <div className="space-y-1.5 border-t border-separator/60 pt-2">
+                <div className="flex items-center justify-between text-[11px] text-muted">
+                  <span>正在打印</span>
+                  <span className="mono">
+                    {activeJob.progress.printed}/{activeJob.progress.total}
+                  </span>
+                </div>
+                <div className="h-1.5 overflow-hidden rounded-full bg-default/60">
+                  <div
+                    className="h-full rounded-full bg-accent transition-all"
+                    style={{
+                      width: `${Math.min(100, Math.round((activeJob.progress.printed / Math.max(1, activeJob.progress.total)) * 100))}%`,
+                    }}
+                  />
+                </div>
+              </div>
+            ) : null}
+          </section>
+        </div>
       </div>
     </div>
   );

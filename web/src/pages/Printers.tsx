@@ -1,9 +1,15 @@
 import {useCallback, useEffect, useState} from "react";
 import {Chip, Spinner} from "@heroui/react";
 import {api, printerStateLabel, type Printer, type PrinterQueueCount} from "../lib/api";
-import {ChevronRightIcon, PrinterIcon} from "../components/Icon";
+import {ChevronRightIcon, PlusCircleIcon, PrinterIcon} from "../components/Icon";
 
-export default function PrintersPage({onOpen}: {onOpen: (id: string) => void}) {
+export default function PrintersPage({
+  onOpen,
+  onAdd,
+}: {
+  onOpen: (id: string) => void;
+  onAdd: () => void;
+}) {
   const [printers, setPrinters] = useState<Printer[]>([]);
   const [queues, setQueues] = useState<Record<string, PrinterQueueCount>>({});
   const [loading, setLoading] = useState(true);
@@ -47,9 +53,13 @@ export default function PrintersPage({onOpen}: {onOpen: (id: string) => void}) {
   if (printers.length === 0) {
     return (
       <div className="grid min-h-[50vh] place-items-center">
-        <div className="grid size-16 place-items-center rounded-2xl border border-dashed border-separator/80 text-muted/60">
-          <PrinterIcon size={28} />
-        </div>
+        <button
+          className="group grid place-items-center gap-3 rounded-2xl border border-dashed border-separator/80 px-10 py-8 text-muted/60 transition hover:border-accent/50 hover:text-accent"
+          onClick={onAdd}
+          type="button"
+        >
+          <PlusCircleIcon size={28} />
+        </button>
       </div>
     );
   }
@@ -59,6 +69,13 @@ export default function PrintersPage({onOpen}: {onOpen: (id: string) => void}) {
       {printers.map((p) => (
         <PrinterCard key={p.id} printer={p} queue={queues[p.id]} onOpen={() => onOpen(p.id)} />
       ))}
+      <button
+        className="flex min-h-[132px] items-center justify-center rounded-2xl border border-dashed border-separator/70 text-muted/50 transition hover:border-accent/50 hover:text-accent"
+        onClick={onAdd}
+        type="button"
+      >
+        <PlusCircleIcon size={24} />
+      </button>
     </div>
   );
 }

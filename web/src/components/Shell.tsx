@@ -3,11 +3,11 @@ import {Button} from "@heroui/react";
 import type {Session} from "../App";
 import PrintersPage from "../pages/Printers";
 import PrinterDetailPage from "../pages/PrinterDetail";
+import AddPrinterPage from "../pages/AddPrinter";
 import {LogoutIcon, PrinterIcon} from "./Icon";
 
-// Two views only: the printer list and one printer's queue. Accounts,
-// quotas, groups and discovery are intentionally not reachable from here yet.
-type Route = {view: "list"} | {view: "detail"; id: string};
+// Accounts, quotas and groups are intentionally not reachable from here yet.
+type Route = {view: "list"} | {view: "detail"; id: string} | {view: "add"};
 
 export default function Shell({
   session,
@@ -25,7 +25,8 @@ export default function Shell({
   }, []);
 
   function go(next: Route) {
-    window.location.hash = next.view === "detail" ? `/p/${next.id}` : "";
+    window.location.hash =
+      next.view === "detail" ? `/p/${next.id}` : next.view === "add" ? "/add" : "";
     setRoute(next);
   }
 
@@ -63,8 +64,16 @@ export default function Shell({
             printerId={route.id}
             onBack={() => go({view: "list"})}
           />
+        ) : route.view === "add" ? (
+          <AddPrinterPage
+            onAdded={(id) => go({view: "detail", id})}
+            onBack={() => go({view: "list"})}
+          />
         ) : (
-          <PrintersPage onOpen={(id) => go({view: "detail", id})} />
+          <PrintersPage
+            onAdd={() => go({view: "add"})}
+            onOpen={(id) => go({view: "detail", id})}
+          />
         )}
       </main>
     </div>
@@ -73,5 +82,7 @@ export default function Shell({
 
 function readHash(): Route {
   const m = window.location.hash.match(/^#\/p\/(.+)$/);
-  return m ? {view: "detail", id: decodeURIComponent(m[1])} : {view: "list"};
+  if (m) return {view: "detail", id: decodeURIComponent(m[1])};
+  if (window.location.hash === "#/add") return {view: "add"};
+  return {view: "list"};
 }
