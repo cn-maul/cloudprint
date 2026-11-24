@@ -33,7 +33,18 @@ docker compose restart cloudprint
 
 ## 其他品牌
 
-`printer-driver-all` 与 `openprinting-ppds` 已包含在镜像里，惠普、兄弟、
-爱普生、佳能等的常见机型可以直接匹配。厂商专有驱动同样把 PPD 放进
-`/usr/share/cups/model/<品牌>/`、过滤器放进 `/usr/lib/cups/filter/`，
-然后重启 cupsd。
+镜像里**没有**预装 `openprinting-ppds` / `printer-driver-all`：它们会把镜像撑大
+约 29 MB（`openprinting-ppds` 还依赖 python3），而常用机型已经由奔图厂商 PPD
+或无驱队列覆盖。需要惠普、兄弟、爱普生、佳能等机型的现成 PPD 时，二选一：
+
+```bash
+# 方式一：在容器内装包（约 29 MB，重建容器后需要重做）
+docker compose exec -u root cloudprint \
+  sh -c 'apt-get update && apt-get install -y --no-install-recommends openprinting-ppds'
+docker compose restart cloudprint
+
+# 方式二：把所需 PPD 单独放进 /data 挂载的目录
+```
+
+厂商专有驱动同样把 PPD 放进 `/usr/share/cups/model/<品牌>/`、过滤器放进
+`/usr/lib/cups/filter/`，然后重启 cupsd。

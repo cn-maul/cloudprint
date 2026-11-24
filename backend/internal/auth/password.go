@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"runtime/debug"
 	"strconv"
 	"strings"
 
@@ -19,10 +20,23 @@ const (
 	keyLength   uint32 = 32
 )
 
+// releaseScratch hands argon2id's working set back to the OS.
+//
+// argon2.IDKey derives the key in one `memory`-KiB allocation (64 MiB with the
+// parameters above) and returns only the 32-byte key, so the scratch block is
+// garbage the moment the hash finishes. The Go runtime keeps that garbage as
+// free spans and never returns it to the kernel on its own, which leaves a
+// 130 MB container RSS on a box that is otherwise idle. Logins are rare, so
+// one scavenge per hash costs far less than sitting on the 64 MiB forever.
+func releaseScratch() {
+	debug.FreeOSMemory()
+}
+
 func HashPassword(password string) (string, error) {
 	if len(password) < 8 {
 		return "", fmt.Errorf("密码至少需要 8 个字符")
 	}
+	defer releaseScratch()
 	salt := make([]byte, saltLength)
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
@@ -35,6 +49,7 @@ func HashPassword(password string) (string, error) {
 }
 
 func VerifyPassword(password, encoded string) bool {
+	defer releaseScratch()
 	parts := strings.Split(encoded, "$")
 	if len(parts) != 6 || parts[1] != "argon2id" {
 		return false

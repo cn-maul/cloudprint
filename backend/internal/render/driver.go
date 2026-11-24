@@ -52,11 +52,38 @@ type DriverOptions struct {
 
 // DriverResult is the converted document plus the MIME type to declare to the
 // device.
+//
+// The stream stays on disk: a vendor filter easily emits tens of megabytes per
+// page, and reading it back into a []byte only to hand it to the IPP client
+// doubled the peak memory of every job. The caller owns the file and must call
+// Close once the upload has been written.
 type DriverResult struct {
-	Data   []byte
+	Path string
+	Size int64
+	// Format is the MIME type to declare to the device.
 	Format string
-	// Program names the filter that produced Data, for logging.
+	// Program names the filter that produced Path, for logging.
 	Program string
+}
+
+// Close removes the temporary file holding the converted stream.
+func (r *DriverResult) Close() {
+	if r != nil && r.Path != "" {
+		_ = os.Remove(r.Path)
+	}
+}
+
+// ClampToDeadline keeps a nested step (rasterize, convert, filter) inside the
+// job's own dispatch deadline. Without it an inner 15-minute budget would let a
+// step outlive the dispatch that is waiting for it, and the outer cancellation
+// would look like a mysterious failure.
+func ClampToDeadline(ctx context.Context, want time.Duration) time.Duration {
+	if dl, ok := ctx.Deadline(); ok {
+		if left := time.Until(dl); left < want {
+			return left
+		}
+	}
+	return want
 }
 
 // ParseFilters extracts every *cupsFilter and *cupsFilter2 line from a PPD.
@@ -302,17 +329,14 @@ func DriverChain(ctx context.Context, opt DriverOptions) (*DriverResult, error) 
 	}
 	// cupsColorSpace 0 is DeviceGray and cupsBitsPerColor 8 matches what the
 	// vendor PPDs declare; monochrome printers halftone it themselves.
-	args := []string{
-		"-q", "-dNOPAUSE", "-dBATCH", "-dSAFER",
-		"-sDEVICE=cups",
-		"-r" + strconv.Itoa(opt.DPI),
-		"-dDEVICEWIDTHPOINTS=" + strconv.FormatFloat(width, 'f', 3, 64),
-		"-dDEVICEHEIGHTPOINTS=" + strconv.FormatFloat(height, 'f', 3, 64),
+	args := append([]string{"-sDEVICE=cups"},
+		mediaFitArgs(opt.DPI, width, height)...)
+	args = append(args,
 		"-dcupsBitsPerColor=8", "-dcupsColorSpace=0", "-dcupsColorOrder=0",
-		"-sOutputFile=" + rasterPath,
+		"-sOutputFile="+rasterPath,
 		source,
-	}
-	if err := runWithTimeout(ctx, gs, args, 5*time.Minute); err != nil {
+	)
+	if err := runWithTimeout(ctx, gs, args, ClampToDeadline(ctx, 15*time.Minute)); err != nil {
 		return nil, err
 	}
 	return runVendorFilter(ctx, opt, spec, filterPath, rasterPath)
@@ -328,7 +352,6 @@ func runVendorFilter(ctx context.Context, opt DriverOptions, spec FilterSpec, fi
 	}
 	destPath := tmp.Name()
 	_ = tmp.Close()
-	defer os.Remove(destPath)
 
 	media := opt.MediaName
 	if media == "" {
@@ -343,22 +366,26 @@ func runVendorFilter(ctx context.Context, opt DriverOptions, spec FilterSpec, fi
 	// vendor filters read the PPD to learn paper and resolution, exactly as
 	// cupsd would arrange for them.
 	cmdArgs := []string{jobID, user, title, strconv.Itoa(opt.Copies), options, input}
-	out, err := runFilter(ctx, filterPath, cmdArgs, destPath, opt.PPDPath, 3*time.Minute)
+	out, err := runFilter(ctx, filterPath, cmdArgs, destPath, opt.PPDPath, ClampToDeadline(ctx, 15*time.Minute))
 	if err != nil {
+		_ = os.Remove(destPath)
 		return nil, err
 	}
-	data, err := os.ReadFile(out)
+	st, err := os.Stat(out)
 	if err != nil {
+		_ = os.Remove(destPath)
 		return nil, err
 	}
-	if len(data) < 16 {
-		return nil, fmt.Errorf("厂商过滤器没有产出有效数据（%d 字节）", len(data))
+	if st.Size() < 16 {
+		_ = os.Remove(destPath)
+		return nil, fmt.Errorf("厂商过滤器没有产出有效数据（%d 字节）", st.Size())
 	}
 	mime := spec.Dest
 	if mime == "" || mime == "application/vnd.cups-raster" {
+		_ = os.Remove(destPath)
 		return nil, fmt.Errorf("过滤器 %s 没有产出设备能直接接收的格式", spec.Program)
 	}
-	return &DriverResult{Data: data, Format: mime, Program: spec.Program}, nil
+	return &DriverResult{Path: destPath, Size: st.Size(), Format: mime, Program: spec.Program}, nil
 }
 
 // toPostScript converts the job PDF to PostScript for PPDs whose filter reads
@@ -375,7 +402,7 @@ func toPostScript(ctx context.Context, opt DriverOptions, source string) (string
 	// pdftops keeps selectable text and is much faster than a Ghostscript
 	// raster round-trip.
 	args := []string{"-q", "-level3", source, out}
-	runCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	runCtx, cancel := context.WithTimeout(ctx, ClampToDeadline(ctx, 10*time.Minute))
 	defer cancel()
 	if bin, lerr := exec.LookPath("pdftops"); lerr == nil {
 		cmd := exec.CommandContext(runCtx, bin, args...)
@@ -420,12 +447,13 @@ func postScriptChain(ctx context.Context, opt DriverOptions) (*DriverResult, err
 	if err != nil {
 		return nil, err
 	}
-	defer cleanup()
-	data, err := os.ReadFile(ps)
+	st, err := os.Stat(ps)
 	if err != nil {
+		cleanup()
 		return nil, err
 	}
-	return &DriverResult{Data: data, Format: "application/postscript", Program: "postscript"}, nil
+	// Ownership of the file moves to the caller through DriverResult.Close.
+	return &DriverResult{Path: ps, Size: st.Size(), Format: "application/postscript", Program: "postscript"}, nil
 }
 
 // runFilter executes a vendor filter with its output redirected to destPath.

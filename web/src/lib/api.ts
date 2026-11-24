@@ -6,6 +6,7 @@ export type User = {
   daily_page_quota: number;
   is_active: boolean;
   must_change_password: boolean;
+  is_guest: boolean;
 };
 
 export type UserGroup = {
@@ -256,6 +257,13 @@ export type UploadResult = {
   size_bytes: number;
   page_count: number;
   converted: boolean;
+  /** Detected paper of the first page ("A4", "A3", "A5", "Letter", "Legal"), empty for a custom size. */
+  paper_size: string;
+  /** True when later pages use a different paper size than the first page. */
+  paper_mixed: boolean;
+  /** When the upload is deleted from the server, RFC 3339. */
+  expires_at: string;
+  retention_days: number;
   preview_url: string;
 };
 
@@ -298,12 +306,75 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (await res.json()) as T;
 }
 
+// apiUpload posts a file and reports how much of it has been sent.
+//
+// fetch() cannot report upload progress, and it has no timeout: a stalled
+// upload left the caller's "uploading" flag set for minutes, which in turn made
+// the picker look dead. XHR gives both a progress event and a hard deadline.
+//
+// The deadline is split in two. The upload itself must finish within
+// uploadTimeoutMs. Once the last byte is sent the server still has to convert
+// the document (Ghostscript runs at roughly 1-3 s per page), so the wait for
+// the response gets its own, longer budget. A single 5-minute timer covering
+// both used to abort the request while the server was still converting.
+export function apiUpload<T>(
+  path: string,
+  form: FormData,
+  opts: {onProgress?: (percent: number) => void; uploadTimeoutMs?: number; responseTimeoutMs?: number} = {},
+): Promise<T> {
+  const {onProgress, uploadTimeoutMs = 5 * 60_000, responseTimeoutMs = 20 * 60_000} = opts;
+  return new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", API_BASE + path);
+    if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
+    xhr.timeout = uploadTimeoutMs;
+    xhr.upload.onload = () => {
+      // Bytes are on the wire; only server-side conversion remains.
+      xhr.timeout = responseTimeoutMs;
+    };
+    xhr.upload.onprogress = (e) => {
+      if (!onProgress) return;
+      onProgress(e.lengthComputable && e.total > 0 ? Math.round((e.loaded / e.total) * 100) : 0);
+    };
+    xhr.onload = () => {
+      let data: unknown = null;
+      try {
+        data = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        /* non-JSON body */
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(data as T);
+        return;
+      }
+      const env = data as ErrorEnvelope | null;
+      const err = new Error(env?.error?.message || `上传失败（${xhr.status}）`) as Error & {
+        code?: string;
+        status?: number;
+      };
+      err.code = env?.error?.code || "";
+      err.status = xhr.status;
+      reject(err);
+    };
+    xhr.onerror = () => reject(new Error("上传中断，请检查电脑与服务器的网络后重试"));
+    xhr.ontimeout = () => reject(new Error("上传超时。请确认文件是否过大，或网络是否正常"));
+    xhr.onabort = () => reject(new Error("已取消上传"));
+    xhr.send(form);
+  });
+}
+
 export const fmt = {
   date(v?: string) {
     if (!v) return "—";
     const d = new Date(v);
     if (Number.isNaN(d.getTime())) return v;
     return d.toLocaleString("zh-CN", {month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"});
+  },
+  day(v?: string) {
+    if (!v) return "—";
+    const d = new Date(v);
+    if (Number.isNaN(d.getTime())) return v;
+    return d.toLocaleDateString("zh-CN", {month: "2-digit", day: "2-digit"});
   },
   bytes(n: number) {
     if (n < 1024) return `${n} B`;

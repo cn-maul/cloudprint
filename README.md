@@ -14,6 +14,11 @@ CloudPrint 服务负责排队、转换与派发。打印机地址与型号不写
 - 端点类型：`ipp`（设备原生支持 PDF 时直连）、`cups`（本机 CUPS 队列 + 厂商驱动）
 - 发现与审批：mDNS、受控 CIDR 扫描、手工候选；发现结果不会自动启用
 - 文件流水线：PDF 校验/页数、JPG/PNG 转 PDF（V1 不收 Office 文档）
+- 纸张适配：识别每一页的 MediaBox（A4/A3/A5/Letter/Legal/自定义），非 A4 与横向页
+  由 Ghostscript 逐页缩放铺满 A4 后再交给厂商过滤器，避免 A3/A5 只打出空白纸
+- 文件保留：上传的原始文件、转换后的 PDF 默认保留 7 天，过期后由后台任务删除并
+  清掉对应预览图；进程启动时立即扫一次，之后每 6 小时扫一次。删除用户、清理历史
+  留下的无主原件与 PDF 也会被同一任务回收
 - 打印任务：排队、打印机级串行、状态机、SSE 实时推送、取消、失败重试、
   已完成任务再打一份、设备进度（已出纸张数）、每日页数额度
 - 每日额度按 NAS 本地时间的零点重置
@@ -75,6 +80,12 @@ docker compose up -d --build
 反向代理时请把 `CLOUDPRINT_PUBLIC_URL` 设为外部访问地址，并只在可信代理后开启
 `CLOUDPRINT_TRUST_PROXY_HEADERS=true`。
 
+镜像只装运行时装得下的东西：CUPS + Ghostscript + poppler，中文用
+`fonts-wqy-microhei`（约 5 MB），不预装 `openprinting-ppds` 与
+`printer-driver-all`。驱动来源是奔图厂商 PPD 或无驱队列（`-m everywhere`）；
+要支持惠普、兄弟等没有厂商驱动包的机型，按 `deploy/drivers/README.md` 在容器内
+补装 `openprinting-ppds`（约 29 MB）。
+
 群晖/威联通若使用 Container Manager，直接导入 `docker-compose.yml`，把 `./data`
 映射到 NAS 的共享文件夹，并给容器固定局域网 IP 或保留端口。
 
@@ -82,14 +93,18 @@ docker compose up -d --build
 
 1. **打印机 → 搜索打印机**。系统同时搜索局域网设备，通常 10–40 秒完成。
 2. 在结果里核对名字，点 **添加**。已添加过的打印机不会重复出现在搜索结果里；
-   找不到时可以在 **手动添加** 里填打印机地址（例如 `192.168.2.91`）。
+   找不到时可以在 **手动添加** 里填打印机地址（例如 `192.168.1.50`）。
 3. 如果设备不直接接收 PDF（例如奔图 MS6000NW），CloudPrint 优先使用服务器上已
    安装的厂商 PPD：队列的 PPD 决定了用哪个 filter 把光栅转成设备自己的格式。
    只有找不到厂商 PPD 时，才退回无驱队列（`-m everywhere`）。全程不需要其他
    电脑常开。
 
-最后到 **成员与权限 → 新建分组**，勾选组员和打印机。普通用户只能看到并使用本组
-授权的设备。
+默认没有会话的请求按访客处理：访客能看到并使用已经添加的打印机，但添加、停用、
+删除打印机要先用右上角的 **管理员登录**。管理员登录后，**管理** 页可以查看全部
+打印机、停用/开放、删除，并进入 **扫描添加打印机**。
+
+用户组授权（`/api/admin/groups`）后端已完成，但前端没有 **成员与权限** 入口，
+现状与恢复方式见 `deploy/nas/README.md` 的「管理员功能」一节。
 
 界面不使用 IPP、mDNS、端点等技术词。真实判定只看设备能否直接接收 PDF：不能直接
 接收的机型会显示为“需要服务器驱动”，由 CUPS 队列出纸，避免任务提交成功却不出纸。
@@ -107,11 +122,14 @@ Linux 上不需要 Windows 中继：CUPS 负责驱动和格式转换，CloudPrin
 输出（奔图 MS6000NW 就是如此），这类机型必须装厂商 PPD，否则任务会以
 `document-format-error` 失败且不出纸。
 
-安装系统打印机驱动集合：
+在服务器上装 CUPS 基础组件（不带驱动包）：
 
 ```bash
-sudo apt install cups cups-client cups-filters printer-driver-all openprinting-ppds
+sudo apt install cups cups-client cups-filters ghostscript fontconfig fonts-wqy-microhei
 ```
+
+需要惠普、兄弟、爱普生、佳能等机型的现成 PPD 时再加
+`openprinting-ppds`（约 29 MB，会连带 python3）。
 
 奔图官方 Linux 驱动（含 337 个 PPD 与对应 filter），仅在老机型不支持无驱时才需要：
 
@@ -150,8 +168,9 @@ MS6000NW。扫描结果仍会列出其他设备（方便确认「这台机器在
 官方镜像已经处理这两点。奔图驱动自带的 CMS 库需要能正常加载，我们是把
 `/opt/pantum/lib` 里的库软链到系统库目录后 `ldconfig` 解决的。
 
-到 **成员与权限 → 服务器打印驱动** 可以查看已建队列、实际使用的驱动，以及服务器上
-所有 PPD。队列名、驱动名和最近错误都在那里，出纸异常时先看这一页。
+查看队列实际使用的驱动和服务器上所有 PPD，用
+`GET /api/admin/cups/queues` 与 `GET /api/admin/cups/drivers`（前端暂未提供入口）。
+出纸异常时先比对这些接口返回的队列名与驱动名。
 
 只复制 PPD 不复制过滤器是常见错误：`lp` 会收下任务，但打印机收不到可解析的数据，
 表现为“提交成功、不出纸”。
@@ -166,7 +185,7 @@ MS6000NW。扫描结果仍会列出其他设备（方便确认「这台机器在
 | `CLOUDPRINT_PUBLIC_URL` | 空 | 外部访问地址，用于代理下载链接 |
 | `CLOUDPRINT_ADMIN_USER` | `admin` | 初始管理员用户名 |
 | `CLOUDPRINT_ADMIN_PASSWORD` | 随机 | 初始管理员密码，仅首次建库生效 |
-| `CLOUDPRINT_ANONYMOUS` | `false` | 设为 `true` 后免登录，所有请求按管理员处理；仅限可信局域网 |
+| `CLOUDPRINT_ANONYMOUS` | `false` | 设为 `true` 后未登录的请求按访客处理（可用现有打印机，不能管理）；仅限可信局域网 |
 | `CLOUDPRINT_SESSION_HOURS` | `12` | 会话有效期 |
 | `CLOUDPRINT_DAILY_QUOTA` | `50` | 新用户默认每日页数，0 为不限 |
 | `CLOUDPRINT_MAX_UPLOAD_MB` | `50` | 单文件上限 |
@@ -189,10 +208,14 @@ MS6000NW。扫描结果仍会列出其他设备（方便确认「这台机器在
 ```powershell
 cd backend
 go vet ./...
-go test ./internal/ipp
+go test ./...
+
+cd ..\web
+npm run typecheck
 ```
 
-`go test ./internal/ipp` 覆盖多值编码、相邻同类型属性解析与真实响应常见结构。
+覆盖 IPP 编解码与真实响应结构、CUPS 队列命名与 PPD 选型、纸张识别与页范围解析、
+派发预算与并发领取，以及 Web 层的任务/文件流程。
 
 ## 接口概览
 
@@ -221,7 +244,32 @@ go test ./internal/ipp
 ## 开发说明
 
 - 前端开发：`cd web; npm run dev`，Vite 代理到 `127.0.0.1:8080`。
-- 前端构建产物输出到 `backend/cmd/cloudprint/ui`，随后编译进单一二进制。
+- 前端构建产物输出到 `backend/cmd/cloudprint/ui`，随后编译进单一二进制。该目录
+  下的 `index.html` 与 `assets/` 已加入 `.gitignore`，仓库里只保留 `.gitkeep`
+  让 `//go:embed all:ui` 在未构建时也能编译。
+- 改前端后必须重新 `npm run build` 再编译后端，否则二进制里仍是上一次的页面。
 - 数据表由 `backend/internal/database/migrations` 内嵌迁移自动创建。
 - 不要把真实打印机 IP 写进代码或默认配置。
 - CUPS 只在容器内监听 `127.0.0.1:631`，不要把它暴露到局域网。
+
+## 目录结构
+
+```
+backend/
+  cmd/cloudprint/          服务入口；ui/ 内嵌前端资源
+  internal/
+    auth/                  Argon2id 密码、会话、登录限速
+    config/                环境变量与默认值
+    cups/                  CUPS 队列、PPD 与厂商 filter 调用
+    database/              SQLite 打开方式、内嵌迁移、初始数据
+    files/                 PDF 校验、纸张识别、页范围、预览
+    ipp/                   纯 Go IPP 编解码与 Print-Job
+    printer/               端点选择、派发、任务进度
+    render/                Ghostscript 光栅化与 PPD filter 链
+    store/                 SQLite 数据访问
+    support/               已验证机型白名单
+    webapi/                HTTP 路由与各业务 handler
+web/                       React + Tailwind 前端
+deploy/                    Docker 镜像、CUPS 入口脚本、驱动安装脚本
+  nas/                     fnOS/NAS 专用的预编译镜像构建与运行
+```

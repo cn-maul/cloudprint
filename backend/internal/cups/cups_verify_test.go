@@ -48,7 +48,7 @@ func main() {
 		}
 		if has("-l") {
 			fmt.Println("printer pantum-ms6000nw is idle.  enabled since Thu 19 Nov 2026")
-			fmt.Println("\tDevice URI: ipp://192.168.2.91/ipp/print")
+			fmt.Println("\tDevice URI: ipp://192.0.2.10/ipp/print")
 			fmt.Println("\tMake and Model: Pantum MS6000NW Series")
 			return
 		}
@@ -122,7 +122,7 @@ func TestSpoolerPath(t *testing.T) {
 	}
 
 	if err := c.Create(ctx, CreateOptions{
-		Name: "pantum-ms6000nw", DeviceURI: "ipp://192.168.2.91/ipp/print", PPD: ppd,
+		Name: "pantum-ms6000nw", DeviceURI: "ipp://192.0.2.10/ipp/print", PPD: ppd,
 	}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -206,7 +206,7 @@ func main() {
 			fmt.Println("scheduler is running")
 		case strings.Contains(args, "-l"):
 			fmt.Println("printer ms6000nw is idle.  enabled since Thu 19 Nov 2026")
-			fmt.Println("\tDevice URI: ipp://192.168.2.50/ipp/print")
+			fmt.Println("\tDevice URI: ipp://192.0.2.20/ipp/print")
 			fmt.Println("\tMake and Model: Pantum MS6000NW Series")
 		case strings.Contains(args, "-p"):
 			fmt.Println("printer ms6000nw is idle.  enabled since Thu 19 Nov 2026")
@@ -235,7 +235,7 @@ func main() {
 	c.Lpstat = filepath.Join(dir, "lpstat")
 	c.Lp = filepath.Join(dir, "lp")
 	c.Lpadmin = filepath.Join(dir, "lpadmin")
-	got, err := c.UniqueQueueName(context.Background(), "MS6000NW", "pr_abcdef12", "ipp://192.168.2.91/ipp/print")
+	got, err := c.UniqueQueueName(context.Background(), "MS6000NW", "pr_abcdef12", "ipp://192.0.2.10/ipp/print")
 	if err != nil {
 		t.Fatalf("UniqueQueueName: %v", err)
 	}

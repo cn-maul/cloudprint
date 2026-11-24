@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"cloudprint/internal/printer"
 	"cloudprint/internal/store"
 )
 
@@ -73,7 +74,7 @@ func (w *Worker) pollCUPS(ctx context.Context) {
 			if uri, _, ok := w.Server.CUPS.ResolveDeviceJob(ctx, queue, job.ID); ok {
 				jobRef = uri
 				_ = w.Server.Store.SetJobCUPSID(ctx, job.ID, uri)
-			} else if jobOlderThan(job.StartedAt, 10*time.Minute) {
+			} else if deviceOldSince(&job, 10*time.Minute) {
 				_ = w.Server.Store.FailJob(ctx, job.ID, "DEVICE_JOB_LOST",
 					"打印机没有确认收到这个任务。请检查打印机面板是否报错后重新提交。")
 				if updated, gerr := w.Server.Store.GetJob(ctx, job.ID); gerr == nil {
@@ -109,7 +110,7 @@ func (w *Worker) pollCUPS(ctx context.Context) {
 		case err != nil:
 			// The device can be briefly unreachable; leave the job alone and
 			// let the claim lease fail it if this persists.
-			if jobOlderThan(job.StartedAt, 30*time.Minute) {
+			if deviceOldSince(&job, 30*time.Minute) {
 				_ = w.Server.Store.FailJob(ctx, job.ID, "DEVICE_UNREACHABLE",
 					"连不上打印机，无法确认是否出纸。请检查打印机电源和网络后重新提交。")
 				if updated, gerr := w.Server.Store.GetJob(ctx, job.ID); gerr == nil {
@@ -208,7 +209,7 @@ const stallTimeout = 15 * time.Minute
 // failIfStalled fails a job that has made no progress for stallTimeout and
 // reports whether it did so.
 func (w *Worker) failIfStalled(ctx context.Context, job *store.Job, reasons []string) bool {
-	if !jobOlderThan(job.StartedAt, stallTimeout) {
+	if !deviceOldSince(job, stallTimeout) {
 		return false
 	}
 	msg := "打印机长时间没有动作，任务已停止。请检查打印机面板（缺纸、卡纸、暂停）后再重新提交。"
@@ -278,6 +279,21 @@ func jobOlderThan(stamp string, d time.Duration) bool {
 	return time.Since(t) > d
 }
 
+// deviceOldSince reports whether the device has had the document for longer
+// than d without answering.
+//
+// started_at is written when the claim is taken, before Ghostscript runs, so
+// counting device timeouts from it charges render time to the printer: a long
+// document would "lose" its job the moment it arrived. dispatched_at is
+// stamped at the handoff, which is what these timers actually mean.
+func deviceOldSince(job *store.Job, d time.Duration) bool {
+	if job.DispatchedAt == "" {
+		// Still rendering: the device has not seen the document yet.
+		return false
+	}
+	return jobOlderThan(job.DispatchedAt, d)
+}
+
 func (w *Worker) dispatchQueued(ctx context.Context) {
 	jobs, err := w.Server.Store.QueuedJobs(ctx, 10)
 	if err != nil {
@@ -310,7 +326,10 @@ func (w *Worker) dispatchQueued(ctx context.Context) {
 }
 
 func (w *Worker) dispatchOne(ctx context.Context, job store.Job) {
-	cctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	// The budget scales with the page count: rendering is what takes time, and
+	// a fixed three minutes failed every document longer than ~60 pages before
+	// the device was ever contacted.
+	cctx, cancel := context.WithTimeout(ctx, printer.DispatchBudget(printer.JobPages(&job)))
 	defer cancel()
 	res := w.Server.Exec.Dispatch(cctx, &job)
 	updated, err := w.Server.Store.GetJob(ctx, job.ID)

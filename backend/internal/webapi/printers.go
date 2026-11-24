@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	"cloudprint/internal/store"
 	"cloudprint/internal/support"
@@ -20,7 +21,7 @@ func (s *Server) handlePrintersPublic(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]store.Printer, 0, len(printers))
 	for _, p := range printers {
-		allowed, err := s.Store.UserCanUsePrinter(r.Context(), u.ID, u.Role, p.ID)
+		allowed, err := s.Store.UserCanUsePrinter(r.Context(), u, p.ID)
 		if err != nil {
 			s.jsonError(w, err)
 			return
@@ -142,6 +143,22 @@ func (s *Server) handleUpdatePrinter(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeletePrinter(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	// Removing the record without removing its queue leaves an orphan in CUPS
+	// that still holds paper and keeps the device busy for nobody. Queue
+	// deletion is best effort: a broken spooler must not make a dead printer
+	// impossible to remove from the UI, but the failure is logged.
+	if p, err := s.Store.GetPrinter(r.Context(), id); err == nil {
+		for _, ep := range p.Endpoints {
+			if ep.Kind != "cups" || strings.TrimSpace(ep.QueueName) == "" {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+			if err := s.CUPS.Delete(ctx, ep.QueueName); err != nil {
+				s.Log.Warn("delete cups queue failed", "queue", ep.QueueName, "error", err)
+			}
+			cancel()
+		}
+	}
 	if err := s.Store.DeletePrinter(r.Context(), id); err != nil {
 		s.jsonError(w, err)
 		return

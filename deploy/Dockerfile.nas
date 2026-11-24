@@ -13,17 +13,19 @@ ARG https_proxy=""
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
 
-ARG INSTALL_LIBREOFFICE=0
-
 # V1 accepts PDF/JPEG/PNG only, so no Office runtime is installed. If the
-# suite is ever added back, fonts-noto-cjk must come with it or Chinese
-# documents convert to a PDF full of empty boxes.
+# suite is ever added back it needs a Chinese font; the runtime font is
+# fonts-wqy-microhei (5 MB) rather than fonts-noto-cjk (89 MB).
+#
+# No PPD packs here either: drivers come from the vendor payload copied below
+# or from a driverless "-m everywhere" queue. Adding openprinting-ppds back
+# costs about 29 MB because it pulls in python3.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates tzdata poppler-utils wget \
-       fonts-liberation fonts-dejavu-core \
+       fontconfig fonts-wqy-microhei \
        cups cups-client cups-filters cups-ipp-utils \
-       printer-driver-all openprinting-ppds ghostscript \
+       ghostscript \
        libcups2 libcupsimage2 libusb-1.0-0 \
     && rm -rf /var/lib/apt/lists/* \
     # lp is needed to read /etc/cups/ppd/<queue>.ppd (root:lp 0640), lpadmin to

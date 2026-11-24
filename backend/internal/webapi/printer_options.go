@@ -27,7 +27,7 @@ func (s *Server) handlePrinterOptions(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "PRINTER_NOT_FOUND", "打印机不存在")
 		return
 	}
-	allowed, err := s.Store.UserCanUsePrinter(r.Context(), u.ID, u.Role, p.ID)
+	allowed, err := s.Store.UserCanUsePrinter(r.Context(), u, p.ID)
 	if err != nil {
 		s.jsonError(w, err)
 		return

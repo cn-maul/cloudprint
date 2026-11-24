@@ -6,9 +6,12 @@ import {ChevronRightIcon, PlusCircleIcon, PrinterIcon} from "../components/Icon"
 export default function PrintersPage({
   onOpen,
   onAdd,
+  canAdd,
 }: {
   onOpen: (id: string) => void;
   onAdd: () => void;
+  // Registering a printer is an admin task; guests only pick from what exists.
+  canAdd: boolean;
 }) {
   const [printers, setPrinters] = useState<Printer[]>([]);
   const [queues, setQueues] = useState<Record<string, PrinterQueueCount>>({});
@@ -53,13 +56,25 @@ export default function PrintersPage({
   if (printers.length === 0) {
     return (
       <div className="grid min-h-[50vh] place-items-center">
-        <button
-          className="group grid place-items-center gap-3 rounded-2xl border border-dashed border-separator/80 px-10 py-8 text-muted/60 transition hover:border-accent/50 hover:text-accent"
-          onClick={onAdd}
-          type="button"
-        >
-          <PlusCircleIcon size={28} />
-        </button>
+        {canAdd ? (
+          <button
+            className="group grid place-items-center gap-3 rounded-2xl border border-dashed border-separator/80 px-10 py-8 text-muted/60 transition hover:border-accent/50 hover:text-accent"
+            onClick={onAdd}
+            type="button"
+          >
+            <PlusCircleIcon size={28} />
+          </button>
+        ) : (
+          <div className="flex flex-col items-center gap-3 text-center">
+            <div className="grid size-12 place-items-center rounded-xl bg-default/40 text-muted">
+              <PrinterIcon size={22} />
+            </div>
+            <p className="text-sm text-muted">还没有可用的打印机</p>
+            <p className="max-w-xs text-xs text-muted/70">
+              请联系管理员添加打印机，或让他把你加入对应的使用分组。
+            </p>
+          </div>
+        )}
       </div>
     );
   }
@@ -69,13 +84,15 @@ export default function PrintersPage({
       {printers.map((p) => (
         <PrinterCard key={p.id} printer={p} queue={queues[p.id]} onOpen={() => onOpen(p.id)} />
       ))}
-      <button
-        className="flex min-h-[132px] items-center justify-center rounded-2xl border border-dashed border-separator/70 text-muted/50 transition hover:border-accent/50 hover:text-accent"
-        onClick={onAdd}
-        type="button"
-      >
-        <PlusCircleIcon size={24} />
-      </button>
+      {canAdd ? (
+        <button
+          className="flex min-h-[132px] items-center justify-center rounded-2xl border border-dashed border-separator/70 text-muted/50 transition hover:border-accent/50 hover:text-accent"
+          onClick={onAdd}
+          type="button"
+        >
+          <PlusCircleIcon size={24} />
+        </button>
+      ) : null}
     </div>
   );
 }

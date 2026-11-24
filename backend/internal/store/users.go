@@ -22,8 +22,22 @@ func New(db *sql.DB) *Store { return &Store{DB: db} }
 
 func (s *Store) CountUsers(ctx context.Context) (int, error) {
 	var n int
-	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n)
+	// The built-in guest row exists from migration 008 onward. It must not
+	// count as "someone already set this install up", or a fresh database
+	// would skip bootstrap and have no administrator to log in with.
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE is_guest = 0`).Scan(&n)
 	return n, err
+}
+
+// GuestUserID is the fixed row created by migration 008. A constant rather
+// than a lookup keeps the unauthenticated path free of a database round-trip
+// on every request.
+const GuestUserID = "u_guest"
+
+// GuestUser returns the built-in visitor principal. It has no usable password
+// and role "user", so /api/admin refuses it and quota stays at 0 (unlimited).
+func (s *Store) GuestUser(ctx context.Context) (*User, error) {
+	return s.GetUser(ctx, GuestUserID)
 }
 
 func (s *Store) CreateUser(ctx context.Context, username, displayName, passwordHash, role string, quota int) (*User, error) {
@@ -65,20 +79,22 @@ func (s *Store) CreateUser(ctx context.Context, username, displayName, passwordH
 
 func (s *Store) GetUserByUsername(ctx context.Context, username string) (*User, error) {
 	row := s.DB.QueryRowContext(ctx, `SELECT id, username, display_name, password_hash, role,
-		daily_page_quota, is_active, must_change_password, created_at FROM users WHERE username = ?`, username)
+		daily_page_quota, is_active, must_change_password, is_guest, created_at
+		FROM users WHERE username = ?`, username)
 	return scanUser(row)
 }
 
 func (s *Store) GetUser(ctx context.Context, id string) (*User, error) {
 	row := s.DB.QueryRowContext(ctx, `SELECT id, username, display_name, password_hash, role,
-		daily_page_quota, is_active, must_change_password, created_at FROM users WHERE id = ?`, id)
+		daily_page_quota, is_active, must_change_password, is_guest, created_at
+		FROM users WHERE id = ?`, id)
 	return scanUser(row)
 }
 
 func scanUser(row *sql.Row) (*User, error) {
 	var u User
 	err := row.Scan(&u.ID, &u.Username, &u.DisplayName, &u.PasswordHash, &u.Role,
-		&u.DailyPageQuota, &u.IsActive, &u.MustChangePassword, &u.CreatedAt)
+		&u.DailyPageQuota, &u.IsActive, &u.MustChangePassword, &u.IsGuest, &u.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -90,7 +106,8 @@ func scanUser(row *sql.Row) (*User, error) {
 
 func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT id, username, display_name, '' AS password_hash, role,
-		daily_page_quota, is_active, must_change_password, created_at FROM users ORDER BY username`)
+		daily_page_quota, is_active, must_change_password, is_guest, created_at
+		FROM users WHERE is_guest = 0 ORDER BY username`)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +116,7 @@ func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
 	for rows.Next() {
 		var u User
 		if err := rows.Scan(&u.ID, &u.Username, &u.DisplayName, &u.PasswordHash, &u.Role,
-			&u.DailyPageQuota, &u.IsActive, &u.MustChangePassword, &u.CreatedAt); err != nil {
+			&u.DailyPageQuota, &u.IsActive, &u.MustChangePassword, &u.IsGuest, &u.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, u)
@@ -141,6 +158,9 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 	u, err := s.GetUser(ctx, id)
 	if err != nil {
 		return err
+	}
+	if u.IsGuest {
+		return fmt.Errorf("访客账号是内置的，不能删除")
 	}
 	if u.Role == "admin" {
 		var admins int

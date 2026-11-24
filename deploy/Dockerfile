@@ -18,11 +18,26 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w" -o /out/cloudprint ./cmd/cloudprint
 
 FROM debian:bookworm-slim
+# Runtime packages only. The image used to install fonts-noto-cjk (89 MB),
+# openprinting-ppds (7 MB) and printer-driver-all; the last one installs
+# nothing here because every driver it pulls in is a Recommends and this
+# build passes --no-install-recommends.
+#
+# What is left:
+#   - CUPS daemon/client plus the filter chain CloudPrint invokes directly
+#   - Ghostscript + poppler for raster conversion and PDF previews
+#   - fonts-wqy-microhei (5 MB) instead of Noto CJK (89 MB): Chinese text
+#     still renders, just without Noto's full glyph coverage
+#   - No PPD packs. Printers are driven by the vendor PPD installed by
+#     install-pantum-driver.sh, or by the driverless "-m everywhere" queue.
+#
+# Adding openprinting-ppds back costs about 29 MB (it pulls in python3);
+# do it only when a HP/Brother/Epson model without a vendor PPD is needed.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       ca-certificates tzdata fonts-noto-cjk poppler-utils wget curl unzip \
+       ca-certificates tzdata poppler-utils wget curl unzip \
        cups cups-client cups-filters cups-ipp-utils \
-       printer-driver-all openprinting-ppds ghostscript \
+       ghostscript fontconfig fonts-wqy-microhei \
        libcups2 libcupsimage2 libusb-1.0-0 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --home-dir /home/cloudprint --groups lpadmin cloudprint

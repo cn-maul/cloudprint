@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"sort"
 )
 
 const Version11 = 0x0101
@@ -442,17 +441,4 @@ func valuePayload(data []byte, pos, want int) ([]byte, error) {
 		return nil, errors.New("IPP 值越界")
 	}
 	return data[pos+2 : pos+2+l], nil
-}
-
-func (m *Message) SortedAttrNames(groupTag byte) []string {
-	g := m.Group(groupTag)
-	if g == nil {
-		return nil
-	}
-	names := make([]string, 0, len(g.Attributes))
-	for _, a := range g.Attributes {
-		names = append(names, a.Name)
-	}
-	sort.Strings(names)
-	return names
 }

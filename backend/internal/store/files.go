@@ -115,3 +115,44 @@ func (s *Store) ExpiredFiles(ctx context.Context, limit int) ([]StoredFile, erro
 	}
 	return out, rows.Err()
 }
+
+// RetainedFileIDs maps every file whose bytes are still on disk to true. The
+// cleanup loop uses it to find preview images whose upload is already gone:
+// those can never be served again (authorizedFile refuses a cleared path), so
+// leaving them behind only fills the NAS.
+func (s *Store) RetainedFileIDs(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT id FROM files WHERE storage_path <> ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
+// RetainedStoragePaths returns every storage path a retained row still points
+// at. Deleting a user cascades the files rows away but leaves the bytes on
+// disk, so those paths are exactly what the orphan sweep may reclaim.
+func (s *Store) RetainedStoragePaths(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT storage_path FROM files WHERE storage_path <> ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		out[path] = true
+	}
+	return out, rows.Err()
+}

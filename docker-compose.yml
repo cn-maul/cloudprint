@@ -12,8 +12,9 @@ services:
       CLOUDPRINT_DATA: /data
       CLOUDPRINT_ADMIN_USER: admin
       CLOUDPRINT_ADMIN_PASSWORD: ${CLOUDPRINT_ADMIN_PASSWORD:?请在 .env 中设置强密码}
-      # Single-printer pilot: serve every request as the admin identity so the
-      # UI opens directly. Only enable this on a trusted LAN.
+      # With this on, requests without a session become the built-in guest and
+      # can only use existing printers; adding/removing one still requires the
+      # admin login. Leave it off to require a login for every page.
       CLOUDPRINT_ANONYMOUS: ${CLOUDPRINT_ANONYMOUS:-0}
       CLOUDPRINT_PUBLIC_URL: ${CLOUDPRINT_PUBLIC_URL:-}
       CLOUDPRINT_COOKIE_SECURE: ${CLOUDPRINT_COOKIE_SECURE:-false}

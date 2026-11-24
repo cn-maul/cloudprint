@@ -1,0 +1,77 @@
+# fnOS / NAS deployment for the prebuilt runtime image.
+#
+# Unlike docker-compose.yml at the repo root, this file has no `build:` block:
+# the image is cross-compiled on the dev machine and built on the NAS from
+# deploy/Dockerfile.nas, because the NAS cannot reliably reach the Go and Node
+# base images.
+#
+# Layout on the NAS (all of it must survive container rebuilds):
+#
+#   <build-dir>/                  build context, not mounted into the container
+#     cloudprint                  linux/amd64 binary
+#     Dockerfile.nas
+#     cups-entrypoint.sh
+#     pantum/                     vendor PPDs, filters and /opt/pantum libs
+#   <data-root>/cloudprint-ui/
+#     data/                       SQLite DB, originals, generated PDFs, previews
+#     cups/                       queues and PPD bindings
+#     spool/                      CUPS job state and the job counter
+#     cache/                      CUPS attributes cache
+#
+# Build:
+#   cd <build-dir>
+#   docker build -f Dockerfile.nas -t cloudprint:nas \
+#     --build-arg http_proxy=http://<proxy-host>:7891 \
+#     --build-arg https_proxy=http://<proxy-host>:7891 .
+#
+# Run:
+#   cd deploy/nas && docker compose up -d
+#
+# Port: publishes the service on host 8080, the address the office already
+# has bookmarked. The old pilot container that used to own 8080 was stopped
+# (not removed) so this one can take the port; its old data directory is
+# untouched and it can be started again for a rollback after this stack is
+# stopped.
+
+services:
+  cloudprint-ui:
+    image: cloudprint:nas
+    container_name: cloudprint-ui
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      CLOUDPRINT_ADDR: ":8080"
+      CLOUDPRINT_DATA: /data
+      CLOUDPRINT_PDFTOPPM: /usr/bin/pdftoppm
+      CLOUDPRINT_CUPS_HOST: 127.0.0.1:631
+      CLOUDPRINT_ADMIN_PASSWORD: ${CLOUDPRINT_ADMIN_PASSWORD:?请在 .env 中设置强密码}
+      # Requests without a session act as the built-in guest: they can browse
+      # and print on existing printers, but /api/admin (add, remove, disable)
+      # only accepts a real admin login from the "管理员登录" button.
+      CLOUDPRINT_ANONYMOUS: ${CLOUDPRINT_ANONYMOUS:-1}
+      # mDNS needs host networking on most NAS setups; the pilot uses a static
+      # subnet scan instead, so this stays off.
+      CLOUDPRINT_ENABLE_MDNS: ${CLOUDPRINT_ENABLE_MDNS:-false}
+      CLOUDPRINT_ALLOW_PRIVATE_SCAN: ${CLOUDPRINT_ALLOW_PRIVATE_SCAN:-true}
+      TZ: Asia/Shanghai
+    volumes:
+      - /vol1/1000/project/cloudprint-ui/data:/data
+      # cupsd state is runtime spool, not user data. Bind it so queues, PPD
+      # bindings and the job counter survive a rebuild; without /etc/cups the
+      # printer has to be re-added, and without /var/spool/cups job ids restart
+      # at 1 and a stale id could match a new job.
+      - /vol1/1000/project/cloudprint-ui/cups:/etc/cups
+      - /vol1/1000/project/cloudprint-ui/spool:/var/spool/cups
+      - /vol1/1000/project/cloudprint-ui/cache:/var/cache/cups
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s

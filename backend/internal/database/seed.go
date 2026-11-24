@@ -2,18 +2,12 @@ package database
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"strings"
-	"time"
 
 	"cloudprint/internal/auth"
 	"cloudprint/internal/config"
 	"cloudprint/internal/store"
-
-	"github.com/google/uuid"
 )
 
 func Seed(ctx context.Context, st *store.Store, cfg config.Config) (string, error) {
@@ -72,15 +66,3 @@ func seedProfiles(ctx context.Context, st *store.Store) error {
 	}
 	return nil
 }
-
-func tokenHash(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
-}
-
-func normalizeName(s string) string {
-	return strings.ToLower(strings.TrimSpace(s))
-}
-
-var _ = uuid.NewString
-var _ = time.Now

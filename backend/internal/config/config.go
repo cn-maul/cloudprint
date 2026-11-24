@@ -29,9 +29,10 @@ type Config struct {
 	AllowPrivateScan     bool
 	TrustedProxyHeaders  bool
 	BootstrapGeneratedPW bool
-	// AnonymousMode serves every request as the bootstrap admin, with no
-	// login. It exists for a single-printer pilot where the box is reachable
-	// only from the office LAN; accounts and quotas stay unimplemented.
+	// AnonymousMode allows visitors without a session to use the box as a
+	// guest: they can browse printers and print, but every /api/admin route
+	// still requires a real admin session. It exists for a single-printer
+	// pilot on an office LAN where logging in should be optional, not absent.
 	AnonymousMode bool
 }
 

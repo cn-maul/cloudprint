@@ -75,7 +75,6 @@ func (s *Server) Routes() http.Handler {
 	}
 	r.Use(middleware.Recoverer)
 	r.Use(s.securityHeaders)
-	r.Use(middleware.Timeout(10 * time.Minute))
 	r.Use(s.requestLog)
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -89,71 +88,86 @@ func (s *Server) Routes() http.Handler {
 	}
 
 	r.Route("/api", func(r chi.Router) {
-		r.Post("/auth/login", s.handleLogin)
+		// Ordinary API calls are bounded so a stuck handler cannot hold a
+		// connection open forever.
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Timeout(10 * time.Minute))
+			r.Post("/auth/login", s.handleLogin)
+			// `me` answers for every visitor, logged in or not, so the SPA can
+			// tell "please log in" apart from "server unreachable". It is the
+			// only endpoint in this group that runs without sessionAuth.
+			r.Get("/auth/me", s.handleMe)
+			r.Group(func(r chi.Router) {
+				r.Use(s.sessionAuth)
+				r.Get("/auth/csrf", s.handleCSRF)
+				r.Post("/auth/logout", s.handleLogout)
+				r.Patch("/auth/profile", s.handleUpdateProfile)
+				r.Post("/auth/change-password", s.handleChangePassword)
+				r.Get("/dashboard", s.handleDashboard)
+				r.Get("/printers", s.handlePrintersPublic)
+				r.Get("/printers/{id}", s.handlePrinterDetail)
+				r.Post("/files", s.handleUpload)
+				r.Get("/files/{id}/preview", s.handlePreview)
+				r.Get("/files/{id}/download", s.handleDownload)
+				r.Post("/jobs", s.handleCreateJob)
+				r.Get("/jobs", s.handleListJobs)
+				r.Get("/jobs/{id}", s.handleGetJob)
+				r.Post("/jobs/{id}/cancel", s.handleCancelJob)
+				r.Post("/jobs/{id}/retry", s.handleRetryJob)
+				r.Post("/jobs/{id}/reprint", s.handleReprintJob)
+				r.Post("/printers/{id}/jobs/clear", s.handleClearJobs)
+				r.Get("/printers/{id}/events", s.handlePrinterEvents)
+				r.Get("/printers/{id}/diagnostics", s.handlePrinterDiagnostics)
+				r.Get("/printers/{id}/options", s.handlePrinterOptions)
+				r.Post("/printers/{id}/control", s.handlePrinterControl)
+				r.Group(func(r chi.Router) {
+					r.Use(s.adminOnly)
+					r.Get("/admin/dashboard", s.adminDashboard)
+					r.Get("/admin/settings", s.handleSettings)
+					r.Get("/admin/profiles", s.handleProfiles)
+					r.Get("/admin/users", s.handleListUsers)
+					r.Post("/admin/users", s.handleCreateUser)
+					r.Patch("/admin/users/{id}", s.handleUpdateUser)
+					r.Delete("/admin/users/{id}", s.handleDeleteUser)
+					r.Get("/admin/groups", s.handleListGroups)
+					r.Post("/admin/groups", s.handleCreateGroup)
+					r.Get("/admin/groups/{id}", s.handleGetGroup)
+					r.Patch("/admin/groups/{id}", s.handleUpdateGroup)
+					r.Delete("/admin/groups/{id}", s.handleDeleteGroup)
+					r.Put("/admin/groups/{id}/members", s.handleSetGroupMembers)
+					r.Put("/admin/groups/{id}/printers", s.handleSetGroupPrinters)
+					r.Get("/admin/printers", s.handleAdminPrinters)
+					r.Post("/admin/printers", s.handleCreatePrinter)
+					r.Get("/admin/printers/{id}", s.handleAdminPrinter)
+					r.Patch("/admin/printers/{id}", s.handleUpdatePrinter)
+					r.Delete("/admin/printers/{id}", s.handleDeletePrinter)
+					r.Post("/admin/printers/{id}/endpoints", s.handleCreateEndpoint)
+					r.Patch("/admin/endpoints/{id}", s.handleUpdateEndpoint)
+					r.Post("/admin/endpoints/{id}/probe", s.handleProbeEndpoint)
+					r.Post("/admin/printers/{id}/probe", s.handleProbePrinter)
+					r.Get("/admin/candidates", s.handleCandidates)
+					r.Post("/admin/candidates", s.handleAddCandidate)
+					r.Post("/admin/candidates/{id}/approve", s.handleApproveCandidate)
+					r.Post("/admin/candidates/{id}/ignore", s.handleIgnoreCandidate)
+					r.Post("/admin/discover", s.handleDiscover)
+					r.Get("/admin/scan-targets", s.handleScanTargets)
+					r.Post("/admin/printers/quick-add", s.handleQuickAddPrinter)
+					r.Get("/admin/supported-models", s.handleSupportedModels)
+					r.Get("/admin/discovery-runs", s.handleDiscoveryRuns)
+					r.Get("/admin/cups/queues", s.handleCUPSQueues)
+					r.Get("/admin/cups/drivers", s.handleCUPSDrivers)
+					r.Post("/admin/cups/connect", s.handleCUPSConnect)
+					r.Delete("/admin/cups/queues/{name}", s.handleCUPSDeleteQueue)
+				})
+			})
+		})
+		// The event stream is long-lived by design: a 10-minute request deadline
+		// cut every open page's EventSource four to six times an hour and made
+		// it reconnect (and re-read the queue) each time. It keeps its own
+		// keep-alive ping instead.
 		r.Group(func(r chi.Router) {
 			r.Use(s.sessionAuth)
-			r.Get("/auth/me", s.handleMe)
-			r.Get("/auth/csrf", s.handleCSRF)
-			r.Post("/auth/logout", s.handleLogout)
-			r.Patch("/auth/profile", s.handleUpdateProfile)
-			r.Post("/auth/change-password", s.handleChangePassword)
-			r.Get("/dashboard", s.handleDashboard)
-			r.Get("/printers", s.handlePrintersPublic)
-			r.Get("/printers/{id}", s.handlePrinterDetail)
-			r.Post("/files", s.handleUpload)
-			r.Get("/files/{id}/preview", s.handlePreview)
-			r.Get("/files/{id}/download", s.handleDownload)
-			r.Post("/jobs", s.handleCreateJob)
-			r.Get("/jobs", s.handleListJobs)
 			r.Get("/jobs/events", s.handleEvents)
-			r.Get("/jobs/{id}", s.handleGetJob)
-			r.Post("/jobs/{id}/cancel", s.handleCancelJob)
-			r.Post("/jobs/{id}/retry", s.handleRetryJob)
-			r.Post("/jobs/{id}/reprint", s.handleReprintJob)
-			r.Post("/printers/{id}/jobs/clear", s.handleClearJobs)
-			r.Get("/printers/{id}/events", s.handlePrinterEvents)
-			r.Get("/printers/{id}/diagnostics", s.handlePrinterDiagnostics)
-			r.Get("/printers/{id}/options", s.handlePrinterOptions)
-			r.Post("/printers/{id}/control", s.handlePrinterControl)
-			r.Group(func(r chi.Router) {
-				r.Use(s.adminOnly)
-				r.Get("/admin/dashboard", s.adminDashboard)
-				r.Get("/admin/settings", s.handleSettings)
-				r.Get("/admin/profiles", s.handleProfiles)
-				r.Get("/admin/users", s.handleListUsers)
-				r.Post("/admin/users", s.handleCreateUser)
-				r.Patch("/admin/users/{id}", s.handleUpdateUser)
-				r.Delete("/admin/users/{id}", s.handleDeleteUser)
-				r.Get("/admin/groups", s.handleListGroups)
-				r.Post("/admin/groups", s.handleCreateGroup)
-				r.Get("/admin/groups/{id}", s.handleGetGroup)
-				r.Patch("/admin/groups/{id}", s.handleUpdateGroup)
-				r.Delete("/admin/groups/{id}", s.handleDeleteGroup)
-				r.Put("/admin/groups/{id}/members", s.handleSetGroupMembers)
-				r.Put("/admin/groups/{id}/printers", s.handleSetGroupPrinters)
-				r.Get("/admin/printers", s.handleAdminPrinters)
-				r.Post("/admin/printers", s.handleCreatePrinter)
-				r.Get("/admin/printers/{id}", s.handleAdminPrinter)
-				r.Patch("/admin/printers/{id}", s.handleUpdatePrinter)
-				r.Delete("/admin/printers/{id}", s.handleDeletePrinter)
-				r.Post("/admin/printers/{id}/endpoints", s.handleCreateEndpoint)
-				r.Patch("/admin/endpoints/{id}", s.handleUpdateEndpoint)
-				r.Post("/admin/endpoints/{id}/probe", s.handleProbeEndpoint)
-				r.Post("/admin/printers/{id}/probe", s.handleProbePrinter)
-				r.Get("/admin/candidates", s.handleCandidates)
-				r.Post("/admin/candidates", s.handleAddCandidate)
-				r.Post("/admin/candidates/{id}/approve", s.handleApproveCandidate)
-				r.Post("/admin/candidates/{id}/ignore", s.handleIgnoreCandidate)
-				r.Post("/admin/discover", s.handleDiscover)
-				r.Get("/admin/scan-targets", s.handleScanTargets)
-				r.Post("/admin/printers/quick-add", s.handleQuickAddPrinter)
-				r.Get("/admin/supported-models", s.handleSupportedModels)
-				r.Get("/admin/discovery-runs", s.handleDiscoveryRuns)
-				r.Get("/admin/cups/queues", s.handleCUPSQueues)
-				r.Get("/admin/cups/drivers", s.handleCUPSDrivers)
-				r.Post("/admin/cups/connect", s.handleCUPSConnect)
-				r.Delete("/admin/cups/queues/{name}", s.handleCUPSDeleteQueue)
-			})
 		})
 	})
 
@@ -203,28 +217,22 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) sessionAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Anonymous mode: the pilot box has no accounts. Every request acts as
-		// the bootstrap admin so uploads, jobs and printer state all keep their
-		// owner columns filled. CSRF is moot without a session cookie, so it is
-		// skipped too; this must only be enabled on a trusted LAN.
-		if s.Cfg.AnonymousMode {
-			u, err := s.Store.GetUserByUsername(r.Context(), s.Cfg.AdminUsername)
-			if err != nil {
-				writeErr(w, http.StatusServiceUnavailable, "NO_ANONYMOUS_USER", "匿名模式缺少默认用户")
+		// A session is optional: without one the request continues as the
+		// built-in guest. Guests may list, preview and print; /api/admin sits
+		// behind adminOnly, which rejects them, so the privilege boundary is
+		// enforced in one place instead of at every handler.
+		se, user := s.trySession(r)
+		if user == nil {
+			if !s.Cfg.AnonymousMode {
+				writeErr(w, http.StatusUnauthorized, "UNAUTHENTICATED", "请先登录")
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxUser, u)))
-			return
-		}
-		cookie, err := r.Cookie("cp_session")
-		if err != nil || cookie.Value == "" {
-			writeErr(w, http.StatusUnauthorized, "UNAUTHENTICATED", "请先登录")
-			return
-		}
-		se, user, err := s.Store.GetSession(r.Context(), cookie.Value)
-		if err != nil {
-			clearSessionCookie(w)
-			writeErr(w, http.StatusUnauthorized, "UNAUTHENTICATED", "会话已过期，请重新登录")
+			guest, err := s.Store.GuestUser(r.Context())
+			if err != nil {
+				writeErr(w, http.StatusServiceUnavailable, "NO_GUEST_USER", "访客账号缺失，请检查数据库迁移")
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxUser, guest)))
 			return
 		}
 		if isMutating(r.Method) {
@@ -238,6 +246,22 @@ func (s *Server) sessionAuth(next http.Handler) http.Handler {
 		ctx = context.WithValue(ctx, ctxSession, se)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// trySession resolves the session cookie if one is present. A stale or forged
+// cookie is ignored and treated as "not logged in" rather than an error, so a
+// browser that still holds an expired cookie lands on the guest view instead of
+// a permanent 401 loop.
+func (s *Server) trySession(r *http.Request) (*store.Session, *store.User) {
+	cookie, err := r.Cookie("cp_session")
+	if err != nil || cookie.Value == "" {
+		return nil, nil
+	}
+	se, user, err := s.Store.GetSession(r.Context(), cookie.Value)
+	if err != nil {
+		return nil, nil
+	}
+	return se, user
 }
 
 func (s *Server) adminOnly(next http.Handler) http.Handler {

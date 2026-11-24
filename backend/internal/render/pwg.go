@@ -85,20 +85,10 @@ func PWG(ctx context.Context, opt Options) error {
 		defer cleanup()
 		source = repeated
 	}
-	// -dFIXEDMEDIA pins the raster to the requested paper instead of following
-	// whatever MediaBox the PDF declares; without it an A4 job can render at
-	// Letter and the device rejects the size.
-	args := []string{
-		"-q", "-dNOPAUSE", "-dBATCH", "-dSAFER",
-		"-sDEVICE=pwgraster",
-		"-r" + strconv.Itoa(opt.DPI),
-		"-dFIXEDMEDIA",
-		"-dDEVICEWIDTHPOINTS=" + strconv.FormatFloat(width, 'f', 3, 64),
-		"-dDEVICEHEIGHTPOINTS=" + strconv.FormatFloat(height, 'f', 3, 64),
-		"-sOutputFile=" + opt.OutputPath,
-		source,
-	}
-	runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	args := append([]string{"-sDEVICE=pwgraster"},
+		mediaFitArgs(opt.DPI, width, height)...)
+	args = append(args, "-sOutputFile="+opt.OutputPath, source)
+	runCtx, cancel := context.WithTimeout(ctx, ClampToDeadline(ctx, 15*time.Minute))
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, gs, args...)
 	out, err := cmd.CombinedOutput()
@@ -148,6 +138,25 @@ func repeatPDF(ctx context.Context, src string, copies int) (string, func(), err
 		return "", nil, fmt.Errorf("复制打印份数失败: %w", err)
 	}
 	return tmp, cleanup, nil
+}
+
+// mediaFitArgs returns the Ghostscript switches that pin the raster to one
+// paper size and scale the document onto it.
+//
+// -dFIXEDMEDIA alone is not enough: Ghostscript then keeps every page at 1:1
+// and clips whatever falls outside the media box. An A3 notice printed on A4
+// came out as a blank sheet exactly that way. -dPDFFitPage scales larger pages
+// down to fit (and leaves a page that already matches the target size
+// pixel-identical), so both the PWG and the CUPS raster path share this.
+func mediaFitArgs(dpi int, width, height float64) []string {
+	return []string{
+		"-q", "-dNOPAUSE", "-dBATCH", "-dSAFER",
+		"-r" + strconv.Itoa(dpi),
+		"-dFIXEDMEDIA",
+		"-dDEVICEWIDTHPOINTS=" + strconv.FormatFloat(width, 'f', 3, 64),
+		"-dDEVICEHEIGHTPOINTS=" + strconv.FormatFloat(height, 'f', 3, 64),
+		"-dPDFFitPage",
+	}
 }
 
 func tail(s string, n int) string {

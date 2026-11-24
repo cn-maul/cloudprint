@@ -82,15 +82,32 @@ func (c *Client) nextID() uint32 {
 }
 
 func (c *Client) roundTrip(ctx context.Context, op uint16, groups []Group, body []byte) (*Message, error) {
-	id := c.nextID()
-	payload := EncodeRequest(id, op, groups)
+	var r io.Reader
 	if body != nil {
-		payload = append(payload, body...)
+		r = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL, bytes.NewReader(payload))
+	return c.roundTripStream(ctx, op, groups, r, int64(len(body)))
+}
+
+// roundTripStream posts the operation attributes followed by the document.
+//
+// The document is copied from the reader while the request is being written, so
+// nothing larger than the operation attributes is buffered. ContentLength is
+// set explicitly because some printers refuse a chunked request body.
+func (c *Client) roundTripStream(ctx context.Context, op uint16, groups []Group, body io.Reader, bodySize int64) (*Message, error) {
+	id := c.nextID()
+	head := EncodeRequest(id, op, groups)
+	size := int64(len(head))
+	var payload io.Reader = bytes.NewReader(head)
+	if body != nil {
+		payload = io.MultiReader(bytes.NewReader(head), body)
+		size += bodySize
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL, payload)
 	if err != nil {
 		return nil, err
 	}
+	req.ContentLength = size
 	req.Header.Set("Content-Type", "application/ipp")
 	req.Header.Set("Accept", "application/ipp")
 	resp, err := c.HTTP.Do(req)
@@ -297,7 +314,13 @@ type PrintOptions struct {
 	Duplex    string
 	Media     string
 	ColorMode string
-	Document  []byte
+	// Document is streamed straight into the request body. Callers hand over an
+	// *os.File so a long raster is never held in memory: a 200-page A4 job at
+	// 600 dpi is far larger than the RAM a NAS is willing to spare, and
+	// buffering it twice (read + request) was the difference between printing
+	// and being killed by the OOM reaper.
+	Document     io.Reader
+	DocumentSize int64
 }
 
 // FindJobURI looks a just-submitted job up by name. Some devices (the Pantum
@@ -381,10 +404,10 @@ func (c *Client) PrintJob(ctx context.Context, opt PrintOptions) (int, string, e
 		attr("job-name", ValueNameWithoutLang, text(ValueNameWithoutLang, opt.JobName)),
 		attr("document-format", ValueMimeType, text(ValueMimeType, opt.Format)),
 	)
-	msg, err := c.roundTrip(ctx, OpPrintJob, []Group{
+	msg, err := c.roundTripStream(ctx, OpPrintJob, []Group{
 		g,
 		{Tag: TagJobAttributes, Attributes: jobAttrs},
-	}, opt.Document)
+	}, opt.Document, opt.DocumentSize)
 	if err != nil {
 		return 0, "", err
 	}

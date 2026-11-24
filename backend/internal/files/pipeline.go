@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"image"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
@@ -66,6 +65,16 @@ type Prepared struct {
 	SizeBytes int64
 	MIME      string
 	Converted bool
+	// Paper is the paper size this document was laid out for, as detected from
+	// the first page's MediaBox ("A4", "A3", "A5", "Letter", "Legal"), or ""
+	// when the page is none of those. The UI shows it so a teacher can see up
+	// front that the file is not A4 and will be scaled down to fit.
+	Paper string
+	// PaperMixed reports that later pages do not use the same paper as the
+	// first one. Those pages are scaled individually, which is correct but
+	// worth telling the user: a mixed document comes out with different
+	// margins per page.
+	PaperMixed bool
 }
 
 func (p *Pipeline) DetectMIME(name string, head []byte) (string, error) {
@@ -160,7 +169,11 @@ func (p *Pipeline) Prepare(ctx context.Context, inputPath, originalName, mime st
 		}
 		st, _ := os.Stat(out)
 		hash, _ := fileSHA256(out)
-		return &Prepared{PDFPath: out, PageCount: pages, SHA256: hash, SizeBytes: st.Size(), MIME: KindPDF}, nil
+		paper, mixed := detectPaperSizes(out)
+		return &Prepared{
+			PDFPath: out, PageCount: pages, SHA256: hash, SizeBytes: st.Size(),
+			MIME: KindPDF, Paper: paper, PaperMixed: mixed,
+		}, nil
 	case KindJPEG, KindPNG:
 		out, err := p.imageToPDF(inputPath, inputHash, mime)
 		if err != nil {
@@ -168,10 +181,91 @@ func (p *Pipeline) Prepare(ctx context.Context, inputPath, originalName, mime st
 		}
 		st, _ := os.Stat(out)
 		hash, _ := fileSHA256(out)
-		return &Prepared{PDFPath: out, PageCount: 1, SHA256: hash, SizeBytes: st.Size(), MIME: KindPDF, Converted: true}, nil
+		return &Prepared{PDFPath: out, PageCount: 1, SHA256: hash, SizeBytes: st.Size(), MIME: KindPDF, Converted: true, Paper: "A4"}, nil
 	default:
 		return nil, fmt.Errorf("不支持的文档类型")
 	}
+}
+
+// Named page sizes in PDF points, portrait and landscape. The tolerance is
+// deliberately loose: Word, WPS and phone scanner apps all emit sizes a few
+// points off, and those must still be treated as the nominal paper so they
+// print 1:1 instead of being rescaled.
+var namedPapers = []struct {
+	name          string
+	width, height float64
+}{
+	{"A4", 595.276, 841.890},
+	{"A3", 841.890, 1190.551},
+	{"A5", 419.528, 595.276},
+	{"Letter", 612, 792},
+	{"Legal", 612, 1008},
+}
+
+const paperTolerance = 18.0 // ~6 mm; larger than any normal rounding drift
+
+// detectPaperSizes reports the nominal paper size of the first page and
+// whether any later page uses a different one. An unreadable or custom-sized
+// first page returns ""; mixed is reported even when the first page is custom.
+//
+// Every page is checked, not just the first: a scanned cover page is often A4
+// while the notice behind it is A3, and the user would otherwise be told
+// "A4" for a document that needs scaling on page 2.
+func detectPaperSizes(path string) (paper string, mixed bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	dims, err := api.PageDims(context.Background(), f, model.NewDefaultConfiguration())
+	if err != nil || len(dims) == 0 {
+		return "", false
+	}
+	firstKey := paperKey(dims[0].Width, dims[0].Height)
+	paper = namedPaper(dims[0].Width, dims[0].Height)
+	for _, d := range dims[1:] {
+		if paperKey(d.Width, d.Height) != firstKey {
+			mixed = true
+			break
+		}
+	}
+	return paper, mixed
+}
+
+// paperKey identifies a page size for comparison. Named sizes compare by
+// name; a custom size compares by its rounded portrait dimensions, so two
+// pages of the same unknown size are not reported as mixed.
+func paperKey(width, height float64) string {
+	if name := namedPaper(width, height); name != "" {
+		return name
+	}
+	w, h := width, height
+	if w > h {
+		w, h = h, w
+	}
+	return fmt.Sprintf("custom:%.0fx%.0f", w, h)
+}
+
+// namedPaper maps a width/height pair in points to a paper name, or "" when
+// the page is some custom size.
+func namedPaper(width, height float64) string {
+	w, h := width, height
+	if w > h {
+		w, h = h, w
+	}
+	for _, p := range namedPapers {
+		if abs(w-p.width) <= paperTolerance && abs(h-p.height) <= paperTolerance {
+			return p.name
+		}
+	}
+	return ""
+}
+
+func abs(v float64) float64 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 func (p *Pipeline) validatePDF(path string) (int, error) {
@@ -274,15 +368,6 @@ func (p *Pipeline) Preview(ctx context.Context, pdfPath, fileID string, page int
 	return out, nil
 }
 
-func (p *Pipeline) SavePDFCopy(ctx context.Context, src string) (string, error) {
-	dir := filepath.Join(p.Root, "pdf")
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return "", err
-	}
-	dst := filepath.Join(dir, "pdf-"+filepath.Base(src))
-	return dst, copyFile(src, dst)
-}
-
 func pdfPath(root, hash string) (string, error) {
 	dir := filepath.Join(root, "pdf")
 	if err := os.MkdirAll(dir, 0o750); err != nil {
@@ -348,17 +433,4 @@ func minFloat(a, b float64) float64 {
 		return a
 	}
 	return b
-}
-
-func ImageDimensions(path string) (image.Rectangle, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return image.Rectangle{}, err
-	}
-	defer f.Close()
-	cfg, _, err := image.DecodeConfig(f)
-	if err != nil {
-		return image.Rectangle{}, err
-	}
-	return image.Rect(0, 0, cfg.Width, cfg.Height), nil
 }

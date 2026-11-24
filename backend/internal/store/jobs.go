@@ -155,7 +155,8 @@ const jobSelect = `SELECT j.id, j.user_id, COALESCE(u.display_name, u.username, 
 	j.color_mode, j.paper_size, j.page_count, j.error_code, j.error_message,
 	COALESCE(j.retry_of, ''), j.created_at, j.updated_at, COALESCE(j.claimed_at, ''),
 	COALESCE(j.lease_expires_at, ''), COALESCE(j.started_at, ''), COALESCE(j.finished_at, ''),
-	COALESCE(e.queue_name, ''), COALESCE(j.cups_job_id, ''), COALESCE(j.page_range, '')
+	COALESCE(j.dispatched_at, ''), COALESCE(e.queue_name, ''), COALESCE(j.cups_job_id, ''),
+	COALESCE(j.page_range, '')
 	FROM print_jobs j
 	LEFT JOIN users u ON u.id = j.user_id
 	LEFT JOIN printers p ON p.id = j.printer_id
@@ -169,7 +170,7 @@ func scanJob(row rowScanner) (Job, error) {
 		&j.FileName, &j.Status, &j.Copies, &j.Duplex, &j.ColorMode, &j.PaperSize,
 		&j.PageCount, &j.ErrorCode, &j.ErrorMessage, &j.RetryOf, &j.CreatedAt,
 		&j.UpdatedAt, &j.ClaimedAt, &j.LeaseExpires, &j.StartedAt, &j.FinishedAt,
-		&j.QueueName, &j.CUPSJobID, &j.PageRange)
+		&j.DispatchedAt, &j.QueueName, &j.CUPSJobID, &j.PageRange)
 	j.TotalPages = j.PageCount * j.Copies
 	return j, err
 }
@@ -335,16 +336,24 @@ func (s *Store) CompleteJob(ctx context.Context, id, endpointID string, ok bool,
 }
 
 func (s *Store) RequeueExpiredClaims(ctx context.Context) (int, error) {
-	// A local CUPS submit is synchronous, so a row stuck in "printing" means
-	// the process died mid-submit. Its CUPS job id is unknown or unusable;
-	// fail it instead of silently reprinting a document the user already got.
+	// A job in "printing" without a device job id has not been handed to the
+	// printer yet: the process that owns it is rasterizing the document.
+	// dispatched_at is written the moment the document is sent, so a job with
+	// the stamp is never a dead submit, however long the device needs to answer.
+	// The remaining case (no stamp at all) can only be a process that died
+	// mid-render, and the threshold has to sit above the dispatch budget cap
+	// (printer.DispatchBudget, 20 minutes) for that.
+	//
+	// Once the document is accepted the device id is stored and this rule no
+	// longer applies; pollCUPS takes over.
 	res, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET status = 'failed',
 		error_code = 'SUBMIT_TIMEOUT',
 		error_message = '提交打印超时，请确认纸张是否已出；如未出纸请重新提交',
 		finished_at = ?, updated_at = ?
 		WHERE status = 'printing' AND started_at IS NOT NULL
-		AND started_at < ? AND COALESCE(cups_job_id, '') = ''`,
-		Now(), Now(), time.Now().UTC().Add(-10*time.Minute).Format(time.RFC3339))
+		AND started_at < ? AND COALESCE(cups_job_id, '') = ''
+		AND COALESCE(dispatched_at, '') = ''`,
+		Now(), Now(), time.Now().UTC().Add(-25*time.Minute).Format(time.RFC3339))
 	if err != nil {
 		return 0, err
 	}
@@ -365,6 +374,21 @@ func (s *Store) RequeueExpiredClaims(ctx context.Context) (int, error) {
 func (s *Store) SetJobCUPSID(ctx context.Context, id, cupsJob string) error {
 	_, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET cups_job_id = ?,
 		updated_at = ? WHERE id = ?`, cupsJob, Now(), id)
+	return err
+}
+
+// MarkDispatched records the moment the document reached the device.
+//
+// The device-side timers (lost job, stalled job, unreachable printer) count
+// from this stamp rather than from started_at, which is written when the claim
+// is taken and therefore includes the whole render. Without the split a
+// document that legitimately takes most of its dispatch budget to rasterize
+// looks like a dead submit the moment it is sent.
+func (s *Store) MarkDispatched(ctx context.Context, id string) error {
+	now := Now()
+	_, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET dispatched_at = ?,
+		updated_at = ? WHERE id = ? AND status = 'printing' AND dispatched_at = ''`,
+		now, now, id)
 	return err
 }
 
@@ -546,12 +570,6 @@ func (s *Store) QueuedJobs(ctx context.Context, limit int) ([]Job, error) {
 		out = append(out, j)
 	}
 	return out, rows.Err()
-}
-
-func (s *Store) SetJobPDF(ctx context.Context, id, pdfID string, pages int) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE print_jobs SET pdf_file_id = ?, page_count = ?,
-		updated_at = ? WHERE id = ?`, pdfID, pages, Now(), id)
-	return err
 }
 
 func (s *Store) Dashboard(ctx context.Context, userID string) (Dashboard, error) {

@@ -11,6 +11,7 @@ type User struct {
 	DailyPageQuota     int    `json:"daily_page_quota"`
 	IsActive           bool   `json:"is_active"`
 	MustChangePassword bool   `json:"must_change_password"`
+	IsGuest            bool   `json:"is_guest"`
 	CreatedAt          string `json:"created_at"`
 }
 
@@ -202,6 +203,10 @@ type Job struct {
 	ClaimedAt    string `json:"claimed_at,omitempty"`
 	LeaseExpires string `json:"lease_expires_at,omitempty"`
 	StartedAt    string `json:"started_at,omitempty"`
+	// DispatchedAt is when the document was handed to the device, after any
+	// rendering. Device-side timers count from here so a long render is not
+	// mistaken for a stuck printer.
+	DispatchedAt string `json:"dispatched_at,omitempty"`
 	FinishedAt   string `json:"finished_at,omitempty"`
 	TotalPages   int    `json:"total_pages"`
 	PDFPath      string `json:"-"`

@@ -8,6 +8,12 @@ web/node_modules/
 web/dist/
 web/*.tsbuildinfo
 *.tsbuildinfo
+# The SPA is built into the Go embed directory by `npm run build`; the hashed
+# bundle changes on every dependency bump and has no business in Git.
+# Keep the directory itself so `//go:embed all:ui` still compiles on a fresh
+# clone, but ignore the generated index and hashed bundles inside it.
+backend/cmd/cloudprint/ui/assets/
+backend/cmd/cloudprint/ui/index.html
 *.db
 *.db-shm
 *.db-wal

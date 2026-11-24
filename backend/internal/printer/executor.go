@@ -3,7 +3,7 @@ package printer
 import (
 	"context"
 	"errors"
-	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -51,16 +51,23 @@ func (e *Executor) PrintIPP(ctx context.Context, ep *store.Endpoint, job *store.
 		res.Message = "这台打印机不直接接收 PDF，请用 CUPS 队列接入"
 		return res
 	}
-	data, err := os.ReadFile(pdfPath)
+	doc, err := os.Open(pdfPath)
 	if err != nil {
 		res.Message = "读取 PDF 失败: " + err.Error()
 		return res
 	}
-	if len(data) < 100 {
+	defer doc.Close()
+	st, err := doc.Stat()
+	if err != nil {
+		res.Message = "读取 PDF 失败: " + err.Error()
+		return res
+	}
+	if st.Size() < 100 {
 		res.Message = "PDF 文件为空"
 		return res
 	}
-	client, err := ipp.NewClient(ep.URI, 60*time.Second)
+	e.markDispatched(ctx, job)
+	client, err := ipp.NewClient(ep.URI, render.ClampToDeadline(ctx, 10*time.Minute))
 	if err != nil {
 		res.Message = err.Error()
 		return res
@@ -71,14 +78,15 @@ func (e *Executor) PrintIPP(ctx context.Context, ep *store.Endpoint, job *store.
 		colorMode = "monochrome"
 	}
 	id, uri, err := client.PrintJob(ctx, ipp.PrintOptions{
-		JobName:   job.FileName,
-		UserName:  job.Username,
-		Format:    "application/pdf",
-		Copies:    job.Copies,
-		Duplex:    job.Duplex,
-		Media:     media,
-		ColorMode: colorMode,
-		Document:  data,
+		JobName:      job.FileName,
+		UserName:     job.Username,
+		Format:       "application/pdf",
+		Copies:       job.Copies,
+		Duplex:       job.Duplex,
+		Media:        media,
+		ColorMode:    colorMode,
+		Document:     doc,
+		DocumentSize: st.Size(),
 	})
 	if err != nil {
 		res.Message = err.Error()
@@ -100,6 +108,57 @@ func (e *Executor) PrintIPP(ctx context.Context, ep *store.Endpoint, job *store.
 		"job": job.ID, "ipp_job_id": id, "ms": res.DurationMS,
 	})
 	return res
+}
+
+// DispatchBudget returns how long one job may take from claim to accepted.
+//
+// Rendering dominates: Ghostscript costs roughly 1-3 s per page at 600 dpi on
+// NAS-class CPUs, so the fixed 3-minute cap this used to have marked every
+// document longer than about 60 pages as failed before it ever reached the
+// printer. The budget grows with the page count and stops well short of leaving
+// a printer blocked forever.
+func DispatchBudget(pages int) time.Duration {
+	if pages < 1 {
+		pages = 1
+	}
+	budget := 2*time.Minute + time.Duration(pages)*3*time.Second
+	if budget > 20*time.Minute {
+		return 20 * time.Minute
+	}
+	return budget
+}
+
+// ClaimLease is how long a job may hold its printer's only slot. It matches the
+// dispatch budget: the claim is taken before rendering starts, so a shorter
+// lease would let the requeue sweep hand the same printer a second job while
+// the first one is still rasterizing.
+func ClaimLease(pages int) time.Duration {
+	return DispatchBudget(pages)
+}
+
+// JobPages is how many pages a job will actually put on paper, which is what
+// the dispatch budget and the claim lease are sized against.
+func JobPages(job *store.Job) int {
+	if job == nil {
+		return 1
+	}
+	if job.TotalPages > 0 {
+		return job.TotalPages
+	}
+	if job.PageCount > 0 {
+		return job.PageCount
+	}
+	return 1
+}
+
+// markDispatched stamps the handoff to the device. It is deliberately
+// best-effort: the stamp only refines which timeout applies, it must never
+// abort a print that is otherwise ready to go.
+func (e *Executor) markDispatched(ctx context.Context, job *store.Job) {
+	if job == nil {
+		return
+	}
+	_ = e.Store.MarkDispatched(context.WithoutCancel(ctx), job.ID)
 }
 
 func classifyIPPError(err error) string {
@@ -146,7 +205,7 @@ func (e *Executor) Dispatch(ctx context.Context, job *store.Job) SendResult {
 	if err != nil {
 		return SendResult{Code: "FILE_MISSING", Message: "打印文件不存在"}
 	}
-	claimed, err := e.Store.ClaimQueuedJob(ctx, job.ID, ep.ID, 5*time.Minute)
+	claimed, err := e.Store.ClaimQueuedJob(ctx, job.ID, ep.ID, ClaimLease(JobPages(job)))
 	if err != nil {
 		return SendResult{Code: "STATE_CONFLICT", Message: err.Error()}
 	}
@@ -226,7 +285,7 @@ func (e *Executor) PrintRaster(ctx context.Context, ep *store.Endpoint, job *sto
 		}
 	}
 	rasterPath := render.OutputName(pdfPath)
-	rctx, rcancel := context.WithTimeout(ctx, 5*time.Minute)
+	rctx, rcancel := context.WithTimeout(ctx, render.ClampToDeadline(ctx, 15*time.Minute))
 	err = render.PWG(rctx, render.Options{
 		PDFPath:    pdfPath,
 		OutputPath: rasterPath,
@@ -244,13 +303,21 @@ func (e *Executor) PrintRaster(ctx context.Context, ep *store.Endpoint, job *sto
 		return res
 	}
 	defer os.Remove(rasterPath)
-	data, err := os.ReadFile(rasterPath)
+	rasterFile, err := os.Open(rasterPath)
 	if err != nil {
 		res.Code = "RASTER_READ_FAILED"
 		res.Message = "读取光栅文件失败：" + err.Error()
 		return res
 	}
-	client, err := ipp.NewClient(uri, 3*time.Minute)
+	defer rasterFile.Close()
+	rasterStat, err := rasterFile.Stat()
+	if err != nil {
+		res.Code = "RASTER_READ_FAILED"
+		res.Message = "读取光栅文件失败：" + err.Error()
+		return res
+	}
+	e.markDispatched(ctx, job)
+	client, err := ipp.NewClient(uri, render.ClampToDeadline(ctx, 20*time.Minute))
 	if err != nil {
 		res.Message = err.Error()
 		return res
@@ -260,13 +327,14 @@ func (e *Executor) PrintRaster(ctx context.Context, ep *store.Endpoint, job *sto
 	// devices multiply the raster by the copies attribute and would otherwise
 	// print the document N*N times.
 	id, jobURI, err := client.PrintJob(ctx, ipp.PrintOptions{
-		JobName:   job.ID,
-		UserName:  job.Username,
-		Format:    "image/pwg-raster",
-		Copies:    1,
-		Media:     ippMedia(job.PaperSize),
-		ColorMode: firstNonEmpty(job.ColorMode, "monochrome"),
-		Document:  data,
+		JobName:      job.ID,
+		UserName:     job.Username,
+		Format:       "image/pwg-raster",
+		Copies:       1,
+		Media:        ippMedia(job.PaperSize),
+		ColorMode:    firstNonEmpty(job.ColorMode, "monochrome"),
+		Document:     rasterFile,
+		DocumentSize: rasterStat.Size(),
 	})
 	if err != nil {
 		res.Message = "发送到打印机失败：" + err.Error()
@@ -310,7 +378,7 @@ func (e *Executor) printViaDriver(ctx context.Context, ep *store.Endpoint, job *
 	start := time.Now()
 	res = SendResult{Code: "DRIVER_SEND_FAILED"}
 	defer func() { res.DurationMS = time.Since(start).Milliseconds() }()
-	dctx, dcancel := context.WithTimeout(ctx, 6*time.Minute)
+	dctx, dcancel := context.WithTimeout(ctx, render.ClampToDeadline(ctx, 15*time.Minute))
 	out, err := render.DriverChain(dctx, render.DriverOptions{
 		PDFPath:   pdfPath,
 		PPDPath:   ppdPath,
@@ -336,23 +404,33 @@ func (e *Executor) printViaDriver(ctx context.Context, ep *store.Endpoint, job *
 		})
 		return res
 	}
+	defer out.Close()
 	e.Store.RecordEndpointEvent(ctx, ep.ID, "driver_ok", map[string]any{
-		"job": job.ID, "filter": out.Program, "format": out.Format, "bytes": len(out.Data),
+		"job": job.ID, "filter": out.Program, "format": out.Format, "bytes": out.Size,
 	})
-	client, err := ipp.NewClient(uri, 3*time.Minute)
+	client, err := ipp.NewClient(uri, render.ClampToDeadline(ctx, 20*time.Minute))
 	if err != nil {
 		res.Message = err.Error()
 		return res
 	}
+	doc, err := os.Open(out.Path)
+	if err != nil {
+		res.Code = "DRIVER_READ_FAILED"
+		res.Message = "读取转换结果失败：" + err.Error()
+		return res
+	}
+	defer doc.Close()
+	e.markDispatched(ctx, job)
 	// Copies are already baked into the converted stream.
 	id, jobURI, err := client.PrintJob(ctx, ipp.PrintOptions{
-		JobName:   job.ID,
-		UserName:  job.Username,
-		Format:    out.Format,
-		Copies:    1,
-		Media:     ippMedia(job.PaperSize),
-		ColorMode: firstNonEmpty(job.ColorMode, "monochrome"),
-		Document:  out.Data,
+		JobName:      job.ID,
+		UserName:     job.Username,
+		Format:       out.Format,
+		Copies:       1,
+		Media:        ippMedia(job.PaperSize),
+		ColorMode:    firstNonEmpty(job.ColorMode, "monochrome"),
+		Document:     doc,
+		DocumentSize: out.Size,
 	})
 	if err != nil {
 		res.Message = "发送到打印机失败：" + err.Error()
@@ -394,12 +472,14 @@ func (e *Executor) printSocket(ctx context.Context, ep *store.Endpoint, job *sto
 	res = SendResult{Code: "SOCKET_SEND_FAILED", Untracked: true}
 	defer func() { res.DurationMS = time.Since(start).Milliseconds() }()
 
-	var data []byte
+	// The device stream is kept on disk and copied to the socket, so a long
+	// document never has to fit in memory.
+	var streamPath string
 	var format string
 	var cleanup func()
 	if e.QueuePPD != nil {
 		if ppdPath, _, perr := e.QueuePPD(ctx, firstNonEmpty(ep.QueueName, ep.URI)); perr == nil && ppdPath != "" && render.CanDrive(ppdPath) {
-			dctx, dcancel := context.WithTimeout(ctx, 6*time.Minute)
+			dctx, dcancel := context.WithTimeout(ctx, render.ClampToDeadline(ctx, 15*time.Minute))
 			out, derr := render.DriverChain(dctx, render.DriverOptions{
 				PDFPath:   pdfPath,
 				PPDPath:   ppdPath,
@@ -413,9 +493,10 @@ func (e *Executor) printSocket(ctx context.Context, ep *store.Endpoint, job *sto
 			})
 			dcancel()
 			if derr == nil {
-				data, format = out.Data, out.Format
+				streamPath, format = out.Path, out.Format
+				cleanup = out.Close
 				e.Store.RecordEndpointEvent(ctx, ep.ID, "driver_ok", map[string]any{
-					"job": job.ID, "filter": out.Program, "format": out.Format, "bytes": len(out.Data),
+					"job": job.ID, "filter": out.Program, "format": out.Format, "bytes": out.Size,
 				})
 			} else if !errors.Is(derr, render.ErrNoFilter) {
 				res.Code = "DRIVER_RENDER_FAILED"
@@ -424,11 +505,11 @@ func (e *Executor) printSocket(ctx context.Context, ep *store.Endpoint, job *sto
 			}
 		}
 	}
-	if data == nil {
+	if streamPath == "" {
 		// No usable PPD: a RAW port expects the device's own language, and
 		// PWG-Raster is the best generic answer (most modern lasers take it).
 		rasterPath := render.OutputName(pdfPath)
-		rctx, rcancel := context.WithTimeout(ctx, 5*time.Minute)
+		rctx, rcancel := context.WithTimeout(ctx, render.ClampToDeadline(ctx, 15*time.Minute))
 		err := render.PWG(rctx, render.Options{
 			PDFPath: pdfPath, OutputPath: rasterPath, DPI: dpi,
 			Paper: job.PaperSize, Copies: job.Copies,
@@ -440,13 +521,7 @@ func (e *Executor) printSocket(ctx context.Context, ep *store.Endpoint, job *sto
 			return res
 		}
 		cleanup = func() { _ = os.Remove(rasterPath) }
-		data, err = os.ReadFile(rasterPath)
-		if err != nil {
-			cleanup()
-			res.Code = "RASTER_READ_FAILED"
-			res.Message = "读取光栅文件失败：" + err.Error()
-			return res
-		}
+		streamPath = rasterPath
 		format = "image/pwg-raster"
 	}
 	if cleanup != nil {
@@ -463,8 +538,17 @@ func (e *Executor) printSocket(ctx context.Context, ep *store.Endpoint, job *sto
 		return res
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Minute))
-	if _, err := conn.Write(data); err != nil {
+	_ = conn.SetDeadline(time.Now().Add(20 * time.Minute))
+	doc, err := os.Open(streamPath)
+	if err != nil {
+		res.Code = "RASTER_READ_FAILED"
+		res.Message = "读取待发送文件失败：" + err.Error()
+		return res
+	}
+	defer doc.Close()
+	e.markDispatched(ctx, job)
+	written, err := io.Copy(conn, doc)
+	if err != nil {
 		res.Message = "发送到打印机失败：" + err.Error()
 		e.Store.RecordEndpointEvent(ctx, ep.ID, "print_fail", map[string]any{
 			"error": res.Message, "job": job.ID, "uri": uri,
@@ -478,7 +562,7 @@ func (e *Executor) printSocket(ctx context.Context, ep *store.Endpoint, job *sto
 	res.Code = "OK"
 	res.Message = "已发送到打印机（RAW 9100，无法回读状态）"
 	e.Store.RecordEndpointEvent(ctx, ep.ID, "print_ok", map[string]any{
-		"job": job.ID, "uri": uri, "format": format, "bytes": len(data), "ms": res.DurationMS,
+		"job": job.ID, "uri": uri, "format": format, "bytes": written, "ms": res.DurationMS,
 	})
 	return res
 }
@@ -544,11 +628,4 @@ func (e *Executor) EndpointURI(ctx context.Context, job *store.Job) string {
 		return ""
 	}
 	return ep.URI
-}
-
-func FormatDuration(ms int64) string {
-	if ms < 1000 {
-		return fmt.Sprintf("%dms", ms)
-	}
-	return fmt.Sprintf("%.1fs", float64(ms)/1000)
 }

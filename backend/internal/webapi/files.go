@@ -78,14 +78,18 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"name": originalName, "size": size, "pages": prepared.PageCount, "sha256": sha,
 	})
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"id":          pdf.ID,
-		"file_id":     pdf.ID,
-		"name":        originalName,
-		"mime":        mime,
-		"size_bytes":  size,
-		"page_count":  prepared.PageCount,
-		"converted":   prepared.Converted,
-		"preview_url": "/api/files/" + pdf.ID + "/preview",
+		"id":             pdf.ID,
+		"file_id":        pdf.ID,
+		"name":           originalName,
+		"mime":           mime,
+		"size_bytes":     size,
+		"page_count":     prepared.PageCount,
+		"converted":      prepared.Converted,
+		"paper_size":     prepared.Paper,
+		"paper_mixed":    prepared.PaperMixed,
+		"expires_at":     pdf.ExpiresAt,
+		"retention_days": s.Cfg.RetentionDays,
+		"preview_url":    "/api/files/" + pdf.ID + "/preview",
 	})
 }
 

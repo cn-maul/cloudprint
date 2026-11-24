@@ -236,17 +236,24 @@ func (s *Store) SetGroupPrinters(ctx context.Context, groupID string, printerIDs
 	return tx.Commit()
 }
 
-// UserCanUsePrinter returns true for admins, or when any of the user's groups
-// is granted the printer. This is the single authorization rule used by both
-// listing and job creation.
-func (s *Store) UserCanUsePrinter(ctx context.Context, userID, role, printerID string) (bool, error) {
-	if role == "admin" {
+// UserCanUsePrinter returns true for admins and guests, or when any of the
+// user's groups is granted the printer. This is the single authorization rule
+// used by both listing and job creation.
+//
+// Guests are allowed every printer on purpose: they cannot add or remove one
+// (that lives under /api/admin), so "guest = use what already exists" is
+// exactly this rule. Groups only narrow what a real user account can reach.
+func (s *Store) UserCanUsePrinter(ctx context.Context, u *User, printerID string) (bool, error) {
+	if u == nil {
+		return false, nil
+	}
+	if u.Role == "admin" || u.IsGuest {
 		return true, nil
 	}
 	var n int
 	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_group_members m
 		JOIN user_group_printers gp ON gp.group_id = m.group_id
-		WHERE m.user_id = ? AND gp.printer_id = ?`, userID, printerID).Scan(&n)
+		WHERE m.user_id = ? AND gp.printer_id = ?`, u.ID, printerID).Scan(&n)
 	if err != nil {
 		return false, err
 	}

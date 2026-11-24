@@ -1,7 +1,8 @@
-import {useCallback, useEffect, useRef, useState} from "react";
+import {useCallback, useEffect, useId, useRef, useState} from "react";
 import {Button, Chip, Input, Spinner} from "@heroui/react";
 import {
   api,
+  apiUpload,
   fmt,
   jobStatus,
   printerStateLabel,
@@ -45,9 +46,11 @@ const FILTERS: Array<{key: FilterKey; label: string; status?: string}> = [
 
 export default function PrinterDetailPage({
   printerId,
+  isAdmin,
   onBack,
 }: {
   printerId: string;
+  isAdmin: boolean;
   onBack: () => void;
 }) {
   const [detail, setDetail] = useState<PrinterDetail | null>(null);
@@ -62,9 +65,14 @@ export default function PrinterDetailPage({
   const [copies, setCopies] = useState(1);
   const [queueOpen, setQueueOpen] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState(0);
   const [submitting, setSubmitting] = useState(false);
+  const [removing, setRemoving] = useState(false);
   const [drag, setDrag] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  // A fixed id would collide if the page ever renders twice; useId keeps the
+  // label/input pair unique per instance.
+  const fileInputId = useId();
   const pending = useRef(false);
 
   const load = useCallback(async () => {
@@ -122,10 +130,11 @@ export default function PrinterDetailPage({
   async function upload(f: File | undefined) {
     if (!f) return;
     setUploading(true);
+    setProgress(0);
     try {
       const form = new FormData();
       form.append("file", f);
-      const res = await api<UploadResult>("/api/files", {method: "POST", body: form});
+      const res = await apiUpload<UploadResult>("/api/files", form, {onProgress: setProgress});
       setFile(res);
       setPreviewFailed(false);
       setPreviewPage(1);
@@ -135,6 +144,9 @@ export default function PrinterDetailPage({
       notifyError("上传失败", e instanceof Error ? e.message : "");
     } finally {
       setUploading(false);
+      // Clearing the value lets the same file be chosen again: without it the
+      // change event never fires a second time and the picker looks broken.
+      if (inputRef.current) inputRef.current.value = "";
     }
   }
 
@@ -208,6 +220,28 @@ export default function PrinterDetailPage({
     }
   }
 
+  // Removing a printer is an admin action. Queued work on it is failed first
+  // (the server does that), and finished history stays readable because the
+  // printer name is snapshotted on each job.
+  async function removePrinter() {
+    if (!detail) return;
+    const name = detail.printer.display_name;
+    const ok = window.confirm(
+      `删除打印机「${name}」？\n\n还在排队或正在打印的任务会失败，已完成的记录会保留。`,
+    );
+    if (!ok) return;
+    setRemoving(true);
+    try {
+      await api(`/api/admin/printers/${detail.printer.id}`, {method: "DELETE"});
+      notifySuccess("已删除打印机", name);
+      onBack();
+    } catch (e) {
+      notifyError("删除失败", e instanceof Error ? e.message : "");
+    } finally {
+      setRemoving(false);
+    }
+  }
+
   async function clearFinished() {
     if (finishedCount === 0) return;
     if (!window.confirm(`清除 ${finishedCount} 条已结束的任务记录？正在打印和排队的任务不受影响。`)) return;
@@ -268,6 +302,19 @@ export default function PrinterDetailPage({
         <Button isIconOnly aria-label="刷新" size="sm" variant="ghost" onPress={() => void load()}>
           <RefreshIcon size={17} />
         </Button>
+        {isAdmin ? (
+          <Button
+            isIconOnly
+            aria-label="删除打印机"
+            className="text-danger"
+            isDisabled={removing}
+            size="sm"
+            variant="ghost"
+            onPress={() => void removePrinter()}
+          >
+            {removing ? <Spinner size="sm" /> : <TrashIcon size={17} />}
+          </Button>
+        ) : null}
       </div>
 
       {problem ? (
@@ -279,8 +326,13 @@ export default function PrinterDetailPage({
 
       <input
         accept=".pdf,.jpg,.jpeg,.png"
-        className="hidden"
-        onChange={(e) => void upload(e.target.files?.[0])}
+        className="sr-only"
+        id={fileInputId}
+        onChange={(e) => {
+          const picked = e.target.files?.[0];
+          e.currentTarget.value = "";
+          void upload(picked);
+        }}
         ref={inputRef}
         type="file"
       />
@@ -321,7 +373,28 @@ export default function PrinterDetailPage({
             <span className="min-w-0 flex-1 truncate text-xs">{file ? file.name : "未选择文件"}</span>
             {file ? (
               <>
-                <span className="mono shrink-0 rounded bg-default/50 px-1.5 py-0.5 text-[10px] text-muted">A4</span>
+                {file.paper_mixed ? (
+                  <span
+                    className="mono shrink-0 rounded bg-warning/15 px-1.5 py-0.5 text-[10px] text-warning"
+                    title="文档里各页纸张尺寸不一致，每一页都会单独缩放铺满 A4，边距会不一样"
+                  >
+                    混合纸张 → A4
+                  </span>
+                ) : file.paper_size && file.paper_size !== "A4" ? (
+                  <span
+                    className="mono shrink-0 rounded bg-warning/15 px-1.5 py-0.5 text-[10px] text-warning"
+                    title={`文档是 ${file.paper_size}，打印时会缩放铺满 A4`}
+                  >
+                    {file.paper_size} → A4
+                  </span>
+                ) : (
+                  <span
+                    className="mono shrink-0 rounded bg-default/50 px-1.5 py-0.5 text-[10px] text-muted"
+                    title={file.paper_size ? "文档尺寸是 A4，按原尺寸打印" : "未识别的纸张尺寸，打印时缩放铺满 A4"}
+                  >
+                    {file.paper_size || "自定义 → A4"}
+                  </span>
+                )}
                 <Button isIconOnly aria-label="移除文件" size="sm" variant="ghost" onPress={clearFile}>
                   <CloseIcon size={14} />
                 </Button>
@@ -332,7 +405,12 @@ export default function PrinterDetailPage({
           <div className="relative min-h-0 flex-1 overflow-hidden bg-default/20">
             {uploading ? (
               <div className="absolute inset-0 grid place-items-center">
-                <Spinner size="sm" />
+                <div className="flex flex-col items-center gap-2">
+                  <Spinner size="sm" />
+                  <span className="mono text-[11px] text-muted">
+                    {progress > 0 ? `正在上传 ${progress}%` : "正在上传"}
+                  </span>
+                </div>
               </div>
             ) : file && !previewFailed ? (
               <div className="absolute inset-0 flex items-center justify-center p-5">
@@ -349,18 +427,22 @@ export default function PrinterDetailPage({
               </div>
             ) : (
               <div className="absolute inset-0 grid place-items-center p-6">
-                <button
-                  className={`flex w-full max-w-md flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed px-6 py-16 text-muted transition ${
+                {/* A real label, not a scripted input.click(): several browsers
+                    (WeChat's WebView, older iOS Safari) refuse to open the file
+                    dialog from script when the input is display:none. Label
+                    activation is native and works everywhere. */}
+                <label
+                  className={`flex w-full max-w-md cursor-pointer flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed px-6 py-16 text-muted transition ${
                     drag
                       ? "border-accent text-accent"
                       : "border-separator/80 hover:border-accent/50 hover:text-accent"
                   }`}
-                  onClick={() => inputRef.current?.click()}
-                  type="button"
+                  htmlFor={fileInputId}
                 >
                   <UploadIcon size={30} />
                   <span className="text-sm">选择文件</span>
-                </button>
+                  <span className="text-[11px] text-muted/70">或把文件拖到这里</span>
+                </label>
               </div>
             )}
           </div>
@@ -421,7 +503,7 @@ export default function PrinterDetailPage({
                   </button>
                 ))}
                 <span className="mono ml-auto text-[11px] text-muted">{total}</span>
-                {finishedCount > 0 ? (
+                {isAdmin && finishedCount > 0 ? (
                   <Button
                     isIconOnly
                     aria-label="清除已结束任务"
@@ -544,6 +626,12 @@ export default function PrinterDetailPage({
               <PrinterIcon size={18} />
               打印
             </Button>
+
+            {file && file.retention_days > 0 ? (
+              <p className="text-center text-[10px] text-muted/70">
+                文件保留 {file.retention_days} 天，{fmt.day(file.expires_at)} 自动清理
+              </p>
+            ) : null}
 
             {activeJob?.progress ? (
               <div className="space-y-1.5 border-t border-separator/60 pt-2">

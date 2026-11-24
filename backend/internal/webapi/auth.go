@@ -51,14 +51,25 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
-	u := currentUser(r)
-	se, _ := r.Context().Value(ctxSession).(*store.Session)
+	se, u := s.trySession(r)
+	if u == nil && s.Cfg.AnonymousMode {
+		guest, err := s.Store.GuestUser(r.Context())
+		if err != nil {
+			writeErr(w, http.StatusServiceUnavailable, "NO_GUEST_USER", "访客账号缺失，请检查数据库迁移")
+			return
+		}
+		u = guest
+	}
 	csrf := ""
 	if se != nil {
 		csrf = se.CSRF
 	}
+	// Logged out is a valid state, not an error: the SPA renders the printer
+	// list as a guest and only shows the "管理员登录" button. `anonymous` keeps
+	// its old meaning for deployment scripts ("visitors don't need to log in").
 	writeJSON(w, http.StatusOK, map[string]any{
 		"user": u, "csrf_token": csrf, "anonymous": s.Cfg.AnonymousMode,
+		"authenticated": se != nil,
 	})
 }
 

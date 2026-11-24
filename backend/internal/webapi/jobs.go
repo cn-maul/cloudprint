@@ -32,7 +32,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "PRINTER_NOT_FOUND", "打印机不存在")
 		return
 	}
-	allowed, err := s.Store.UserCanUsePrinter(r.Context(), u.ID, u.Role, in.PrinterID)
+	allowed, err := s.Store.UserCanUsePrinter(r.Context(), u, in.PrinterID)
 	if err != nil {
 		s.jsonError(w, err)
 		return
@@ -162,12 +162,14 @@ func (s *Server) extractPagesForJob(r *http.Request, src *store.StoredFile, sel 
 }
 
 func (s *Server) tryDispatch(jobID, userID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	job, err := s.Store.GetJob(ctx, jobID)
+	lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	job, err := s.Store.GetJob(lookupCtx, jobID)
+	lookupCancel()
 	if err != nil || job.Status != "queued" {
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), printer.DispatchBudget(printer.JobPages(job)))
+	defer cancel()
 	busy, err := s.Store.HasActiveJob(ctx, job.PrinterID)
 	if err != nil || busy {
 		return
@@ -187,8 +189,10 @@ func (s *Server) tryDispatch(jobID, userID string) {
 		return
 	}
 	if res.OK && updated.Status == "printing" {
-		// CUPS accepted the file; the worker publishes completion when the
-		// spooler reports the job drained.
+		// The device accepted the file; pollCUPS publishes completion once it
+		// reports the job drained. Dispatch deliberately leaves the row in
+		// "printing" for this case, so publishing completion here would tell
+		// the user the job is done while the printer is still working.
 		return
 	}
 	if res.OK {
@@ -240,12 +244,19 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 // UI can say something concrete instead of just "done".
 func (s *Server) handleClearJobs(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)
+	// Purging history wipes every user's finished rows for that printer, so it
+	// is a management action even though the row's owner check would not catch
+	// it. Guests keep the queue clean of their own work via cancel instead.
+	if u.Role != "admin" {
+		writeErr(w, http.StatusForbidden, "FORBIDDEN", "只有管理员可以清空任务记录")
+		return
+	}
 	printerID := chi.URLParam(r, "id")
 	if _, err := s.Store.GetPrinter(r.Context(), printerID); err != nil {
 		writeErr(w, http.StatusNotFound, "PRINTER_NOT_FOUND", "打印机不存在")
 		return
 	}
-	allowed, err := s.Store.UserCanUsePrinter(r.Context(), u.ID, u.Role, printerID)
+	allowed, err := s.Store.UserCanUsePrinter(r.Context(), u, printerID)
 	if err != nil {
 		s.jsonError(w, err)
 		return
@@ -422,7 +433,7 @@ func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 			support.RejectMessage(firstNonEmpty(p.Model, p.DisplayName)))
 		return
 	}
-	allowed, err := s.Store.UserCanUsePrinter(r.Context(), u.ID, u.Role, p.ID)
+	allowed, err := s.Store.UserCanUsePrinter(r.Context(), u, p.ID)
 	if err != nil {
 		s.jsonError(w, err)
 		return
